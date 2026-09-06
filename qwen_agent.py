@@ -291,7 +291,13 @@ class SandboxAgent:
             raise AgentError(f"path is not in the {scope_name} allowlist: {relative}")
         candidate = self.root / relative
         try:
-            resolved = candidate.resolve(strict=must_exist)
+            if must_exist:
+                resolved = candidate.resolve(strict=True)
+            else:
+                try:
+                    resolved = candidate.resolve(strict=True)
+                except FileNotFoundError:
+                    resolved = candidate.parent.resolve(strict=True) / candidate.name
         except (FileNotFoundError, RuntimeError) as exc:
             raise AgentError(f"invalid sandbox path: {relative}") from exc
         if not _within(self.root, resolved):

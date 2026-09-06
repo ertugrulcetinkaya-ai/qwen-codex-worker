@@ -125,6 +125,50 @@ class SandboxActionTests(unittest.TestCase):
             "agent mode works\n",
         )
 
+    def test_write_allowed_new_file_in_existing_nested_directory(self):
+        nested = self.root / "nested"
+        nested.mkdir()
+        agent = SandboxAgent(self.root, ["nested/new.txt"])
+
+        result = agent.execute(
+            {
+                "action": "write",
+                "path": "nested/new.txt",
+                "content": "hello\n",
+            }
+        )
+
+        self.assertEqual(result["path"], "nested/new.txt")
+        self.assertEqual((nested / "new.txt").read_text(encoding="utf-8"), "hello\n")
+        self.assertIn("nested/new.txt", agent.changed_paths)
+
+    def test_read_nonexistent_file_is_rejected(self):
+        agent = SandboxAgent(self.root, ["missing.txt"])
+        with self.assertRaisesRegex(AgentError, "invalid sandbox path|does not exist"):
+            agent.execute({"action": "read", "path": "missing.txt"})
+
+    def test_replace_nonexistent_file_is_rejected(self):
+        agent = SandboxAgent(self.root, ["missing.txt"])
+        with self.assertRaisesRegex(AgentError, "invalid sandbox path|does not exist"):
+            agent.execute(
+                {
+                    "action": "replace",
+                    "path": "missing.txt",
+                    "old": "missing",
+                    "new": "replacement",
+                }
+            )
+
+    def test_parent_symlink_escape_is_rejected(self):
+        outside = self.root.parent / "outside-directory"
+        outside.mkdir()
+        self.addCleanup(outside.rmdir)
+        parent_link = self.root / "nested-link"
+        parent_link.symlink_to(outside, target_is_directory=True)
+
+        with self.assertRaisesRegex(AgentError, "escapes sandbox"):
+            SandboxAgent(self.root, ["nested-link/new.txt"])
+
     def test_write_non_allowlisted_file_is_rejected(self):
         agent = SandboxAgent(self.root, ["example.txt"])
         with self.assertRaisesRegex(AgentError, "allowlist"):
