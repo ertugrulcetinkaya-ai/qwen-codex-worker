@@ -65,32 +65,75 @@ Available actions:
 
 Read and write only paths allowed by the caller. Do not access secrets,
 credentials, .env files, or paths outside the sandbox. Use replace for small
-edits. Read an existing file before rewriting it. Stop with done when the
-filesystem state satisfies the task.
+edits. Write is primarily for creating a new file; only replace an existing
+file after that exact file has first been read. A replace.old string must be
+copied exactly from previously read file content. Read an existing file before
+rewriting it. After an action-validation error, use the returned validation
+error to correct the next action; do not repeat the same invalid action
+unchanged. The done action must always include a non-empty summary. Stop with
+done when the filesystem state satisfies the task.
 """
 
 AGENT_RESPONSE_FORMAT = {
     "type": "json_object",
     "schema": {
-        "type": "object",
-        "properties": {
-            "action": {
-                "type": "string",
-                "enum": ["read", "grep", "replace", "write", "done"],
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["read"]},
+                    "path": {"type": "string"},
+                    "start_line": {"type": "integer"},
+                    "end_line": {"type": "integer"},
+                },
+                "required": ["action", "path"],
+                "additionalProperties": False,
             },
-            "path": {"type": "string"},
-            "paths": {"type": "array", "items": {"type": "string"}},
-            "start_line": {"type": "integer"},
-            "end_line": {"type": "integer"},
-            "query": {"type": "string"},
-            "old": {"type": "string"},
-            "new": {"type": "string"},
-            "count": {"type": "integer"},
-            "content": {"type": "string"},
-            "summary": {"type": "string"},
-        },
-        "required": ["action"],
-        "additionalProperties": False,
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["grep"]},
+                    "query": {"type": "string"},
+                    "paths": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                    },
+                },
+                "required": ["action", "query"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["replace"]},
+                    "path": {"type": "string"},
+                    "old": {"type": "string"},
+                    "new": {"type": "string"},
+                    "count": {"type": "integer"},
+                },
+                "required": ["action", "path", "old", "new"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["write"]},
+                    "path": {"type": "string"},
+                    "content": {"type": "string"},
+                },
+                "required": ["action", "path", "content"],
+                "additionalProperties": False,
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "action": {"type": "string", "enum": ["done"]},
+                    "summary": {"type": "string"},
+                },
+                "required": ["action", "summary"],
+                "additionalProperties": False,
+            },
+        ],
     },
 }
 

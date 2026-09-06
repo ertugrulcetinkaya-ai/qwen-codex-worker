@@ -227,6 +227,25 @@ class AgentProtocolTests(unittest.TestCase):
         finally:
             agent.root.rmdir()
 
+    def test_response_format_requires_action_specific_fields(self):
+        schema = qwen_agent.AGENT_RESPONSE_FORMAT["schema"]
+        alternatives = schema["oneOf"]
+        self.assertEqual(len(alternatives), 5)
+        self.assertNotIn("$ref", json.dumps(schema))
+        self.assertNotIn("$defs", json.dumps(schema))
+
+        expected_required = {
+            "read": ["action", "path"],
+            "grep": ["action", "query"],
+            "replace": ["action", "path", "old", "new"],
+            "write": ["action", "path", "content"],
+            "done": ["action", "summary"],
+        }
+        for alternative in alternatives:
+            action = alternative["properties"]["action"]["enum"][0]
+            self.assertEqual(alternative["required"], expected_required[action])
+            self.assertFalse(alternative["additionalProperties"])
+
     def test_stdout_status_contains_no_unified_diff(self):
         result = qwen_agent.AgentResult(
             status="done",
