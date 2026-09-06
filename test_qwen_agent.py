@@ -253,6 +253,7 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         async def handler(request):
             body = json.loads(request.content)
             self.assertEqual(body["chat_template_kwargs"], {"enable_thinking": False})
+            self.assertEqual(body["response_format"], qwen_agent.AGENT_RESPONSE_FORMAT)
             self.assertEqual(body["temperature"], 0.7)
             self.assertEqual(body["top_p"], 0.8)
             self.assertEqual(body["top_k"], 20)

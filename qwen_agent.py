@@ -69,6 +69,31 @@ edits. Read an existing file before rewriting it. Stop with done when the
 filesystem state satisfies the task.
 """
 
+AGENT_RESPONSE_FORMAT = {
+    "type": "json_object",
+    "schema": {
+        "type": "object",
+        "properties": {
+            "action": {
+                "type": "string",
+                "enum": ["read", "grep", "replace", "write", "done"],
+            },
+            "path": {"type": "string"},
+            "paths": {"type": "array", "items": {"type": "string"}},
+            "start_line": {"type": "integer"},
+            "end_line": {"type": "integer"},
+            "query": {"type": "string"},
+            "old": {"type": "string"},
+            "new": {"type": "string"},
+            "count": {"type": "integer"},
+            "content": {"type": "string"},
+            "summary": {"type": "string"},
+        },
+        "required": ["action"],
+        "additionalProperties": False,
+    },
+}
+
 FORBIDDEN_BASENAMES = frozenset(
     {
         "credentials",
@@ -779,6 +804,7 @@ async def _generate_agent_turn(
             "top_k": TOP_K,
             "presence_penalty": PRESENCE_PENALTY,
             "chat_template_kwargs": {"enable_thinking": False},
+            "response_format": AGENT_RESPONSE_FORMAT,
             "stream": True,
             "stream_options": {"include_usage": True},
         },
