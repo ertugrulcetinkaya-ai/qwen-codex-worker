@@ -34,6 +34,8 @@ PRESENCE_PENALTY = 1.5
 MAX_ERROR_BODY_CHARS = 1_000
 MAX_CONNECT_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0)
+PREFLIGHT_MAX_CONNECT_ATTEMPTS = 5
+PREFLIGHT_RETRY_BACKOFF_SECONDS = (0.5, 1.0, 2.0, 4.0)
 HTTP_TIMEOUT = httpx.Timeout(connect=10.0, pool=10.0, write=30.0, read=1_800.0)
 PREFLIGHT_TIMEOUT = httpx.Timeout(connect=3.0, pool=3.0, write=3.0, read=5.0)
 RETRYABLE_CONNECT_ERRORS = (
@@ -42,6 +44,7 @@ RETRYABLE_CONNECT_ERRORS = (
     httpx.PoolTimeout,
     httpx.ReadTimeout,
 )
+RETRYABLE_PREFLIGHT_ERRORS = RETRYABLE_CONNECT_ERRORS + (httpx.ReadError,)
 
 WORKER_ROLE = """You are a code implementation worker. You do not manage the repository.
 Implement only the requested task using the supplied source files.
@@ -349,16 +352,24 @@ async def _request_with_connect_retries(
     json: dict[str, Any] | None = None,
     timeout: httpx.Timeout | None = None,
     sleep: Any = asyncio.sleep,
+    max_attempts: int = MAX_CONNECT_ATTEMPTS,
+    retry_backoff_seconds: tuple[float, ...] = RETRY_BACKOFF_SECONDS,
+    retryable_errors: tuple[type[httpx.HTTPError], ...] = RETRYABLE_CONNECT_ERRORS,
 ) -> tuple[httpx.Response, int]:
     """Establish a response, retrying only failures known to precede headers."""
     started = time.monotonic()
-    for attempt in range(1, MAX_CONNECT_ATTEMPTS + 1):
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be positive")
+    if len(retry_backoff_seconds) < max_attempts - 1:
+        raise ValueError("retry_backoff_seconds must cover every retry")
+
+    for attempt in range(1, max_attempts + 1):
         request = client.build_request(method, url, json=json, timeout=timeout)
         try:
             response = await client.send(request, stream=stream)
             return response, attempt
-        except RETRYABLE_CONNECT_ERRORS as exc:
-            if attempt == MAX_CONNECT_ATTEMPTS:
+        except retryable_errors as exc:
+            if attempt == max_attempts:
                 kind = (
                     "endpoint_timeout"
                     if isinstance(
@@ -371,7 +382,7 @@ async def _request_with_connect_retries(
                     f"{kind}: {stage} attempts={attempt} elapsed_ms={_elapsed_ms(started)}: "
                     f"{type(exc).__name__}: {exc}"
                 ) from exc
-            await sleep(RETRY_BACKOFF_SECONDS[attempt - 1])
+            await sleep(retry_backoff_seconds[attempt - 1])
     raise AssertionError("connection retry loop exhausted unexpectedly")
 
 
@@ -390,6 +401,9 @@ async def _preflight(
         stage="PREFLIGHT_CONNECT",
         timeout=PREFLIGHT_TIMEOUT,
         sleep=sleep,
+        max_attempts=PREFLIGHT_MAX_CONNECT_ATTEMPTS,
+        retry_backoff_seconds=PREFLIGHT_RETRY_BACKOFF_SECONDS,
+        retryable_errors=RETRYABLE_PREFLIGHT_ERRORS,
     )
     if not 200 <= response.status_code < 300:
         raise RuntimeError(

@@ -9,8 +9,8 @@ import httpx
 
 from qwen_worker_server import (
     DEFAULT_MODEL,
-    MAX_CONNECT_ATTEMPTS,
     MAX_OUTPUT_TOKENS,
+    PREFLIGHT_MAX_CONNECT_ATTEMPTS,
     PRESENCE_PENALTY,
     TEMPERATURE,
     TOP_K,
@@ -193,6 +193,42 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, 2)
         self.assertEqual(calls, 2)
 
+    async def test_preflight_retries_multiple_transient_failures_then_succeeds(self):
+        calls = 0
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls < 5:
+                raise httpx.ConnectError("transient refusal", request=request)
+            return httpx.Response(200, json={"data": [{"id": DEFAULT_MODEL}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            attempts = await _preflight(
+                client, "http://qwen.test/v1", DEFAULT_MODEL, sleep=_no_sleep
+            )
+
+        self.assertEqual(attempts, 5)
+        self.assertEqual(calls, 5)
+
+    async def test_preflight_read_disconnect_is_retried(self):
+        calls = 0
+
+        async def handler(request):
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise httpx.ReadError("transient disconnect", request=request)
+            return httpx.Response(200, json={"data": [{"id": DEFAULT_MODEL}]})
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            attempts = await _preflight(
+                client, "http://qwen.test/v1", DEFAULT_MODEL, sleep=_no_sleep
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertEqual(calls, 2)
+
     async def test_preflight_timeout_is_classified_as_endpoint_timeout(self):
         async def handler(request):
             raise httpx.ConnectTimeout("timed out", request=request)
@@ -216,13 +252,14 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with self.assertRaisesRegex(
-                RuntimeError, rf"PREFLIGHT_CONNECT attempts={MAX_CONNECT_ATTEMPTS}"
+                RuntimeError,
+                rf"PREFLIGHT_CONNECT attempts={PREFLIGHT_MAX_CONNECT_ATTEMPTS}",
             ):
                 await _preflight(
                     client, "http://qwen.test/v1", DEFAULT_MODEL, sleep=_no_sleep
                 )
 
-        self.assertEqual(calls, MAX_CONNECT_ATTEMPTS)
+        self.assertEqual(calls, PREFLIGHT_MAX_CONNECT_ATTEMPTS)
 
     async def test_generation_connection_failure_then_safe_retry(self):
         calls = 0
