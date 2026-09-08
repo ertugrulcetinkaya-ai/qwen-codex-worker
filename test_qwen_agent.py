@@ -4,7 +4,9 @@ import contextlib
 import io
 import json
 import os
+import re
 import shlex
+import shutil
 import socket
 import sys
 import tempfile
@@ -457,9 +459,212 @@ class SandboxActionTests(unittest.TestCase):
         self.assertEqual(result["stdout"], "trusted\n")
         self.assertEqual(Path(captured[0][0]).name, "git")
         self.assertNotEqual(Path(captured[0][0]), shadow)
-        self.assertEqual(captured_environment["HOME"], str(self.root.resolve()))
+        scratch = Path(captured_environment["HOME"])
+        self.assertNotEqual(scratch, self.root.resolve())
+        self.assertFalse(scratch.exists())
+        self.assertEqual(
+            captured_environment["PYTHONPYCACHEPREFIX"], str(scratch / "pycache")
+        )
         self.assertNotIn("TOP_SECRET", captured_environment)
         self.assertNotIn(str(self.root), captured_environment["PATH"])
+
+    def test_command_access_policy_uses_canonical_scopes(self):
+        context = self.root / "context.txt"
+        context.write_text("context\n", encoding="utf-8")
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, scratch)
+        agent = SandboxAgent(
+            self.root, ["example.txt"], read_only=["context.txt"]
+        )
+
+        model_policy = agent._command_access_policy(scratch, validation=False)
+        validation_policy = agent._command_access_policy(scratch, validation=True)
+
+        self.assertEqual(
+            [scope.path for scope in model_policy.readable_paths],
+            [
+                self.root.resolve() / "example.txt",
+                self.root.resolve() / "context.txt",
+            ],
+        )
+        self.assertEqual(
+            [scope.path for scope in model_policy.writable_paths],
+            [self.root.resolve() / "example.txt"],
+        )
+        self.assertFalse(model_policy.validation)
+        self.assertEqual(validation_policy.writable_paths, ())
+        self.assertTrue(validation_policy.validation)
+
+    def test_command_profile_denies_forbidden_components_without_root_authority(self):
+        scratch = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, scratch)
+        agent = SandboxAgent(self.root, ["example.txt"])
+        policy = agent._command_access_policy(scratch, validation=False)
+        profile, parameters = qwen_agent._macos_sandbox_profile(
+            self.root, Path(sys.executable).resolve(), policy
+        )
+
+        pattern = qwen_agent._forbidden_command_path_regex(self.root)
+        self.assertRegex(str(self.root / ".env.local"), re.compile(pattern))
+        self.assertRegex(str(self.root / "nested" / ".ENV"), re.compile(pattern))
+        self.assertRegex(
+            str(self.root / "config" / "secrets.json"), re.compile(pattern)
+        )
+        self.assertNotRegex(str(self.root / "example.txt"), re.compile(pattern))
+        self.assertIn("(deny file-read* #", profile)
+        self.assertIn("(deny file-write* #", profile)
+        self.assertNotIn(
+            '(allow file-write* (subpath (param "SANDBOX_ROOT")))', profile
+        )
+        self.assertNotIn(
+            '(allow file-read* file-map-executable (subpath (param "SANDBOX_ROOT")))',
+            profile,
+        )
+        self.assertIn(("SCRATCH", str(scratch)), parameters)
+
+    def test_model_command_mutations_are_accounted_once(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        (generated / "changed.txt").write_text("before\n", encoding="utf-8")
+        (generated / "deleted.txt").write_text("delete\n", encoding="utf-8")
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["generated"], allowed_commands=[command]
+        )
+        captured = {}
+
+        class FakeSandbox:
+            def run(self, _argv, **kwargs):
+                captured.update(kwargs)
+                (generated / "changed.txt").write_text("after\n", encoding="utf-8")
+                (generated / "created.txt").write_text("new\n", encoding="utf-8")
+                (generated / "deleted.txt").unlink()
+                return qwen_agent.CommandResult(0, "", "")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(agent.mutation_generation, 1)
+        self.assertEqual(
+            agent.changed_paths,
+            {
+                "generated/changed.txt",
+                "generated/created.txt",
+                "generated/deleted.txt",
+            },
+        )
+        self.assertFalse(captured["access_policy"].validation)
+        self.assertFalse(captured["access_policy"].scratch_path.exists())
+
+    def test_model_command_without_mutation_keeps_generation(self):
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["example.txt"], allowed_commands=[command]
+        )
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                return qwen_agent.CommandResult(0, "", "")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(agent.changed_paths, set())
+        self.assertEqual(agent.mutation_generation, 0)
+
+    def test_command_scratch_path_is_redacted_from_command_result(self):
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["example.txt"], allowed_commands=[command]
+        )
+
+        class FakeSandbox:
+            def run(self, _argv, **kwargs):
+                scratch = kwargs["access_policy"].scratch_path
+                return qwen_agent.CommandResult(0, f"scratch={scratch}\n", "")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertEqual(result["stdout"], "scratch=[command scratch]\n")
+
+    def test_command_scope_rebinding_to_in_root_symlink_is_rejected(self):
+        allowed = self.root / "allowed"
+        private = self.root / "private"
+        allowed.mkdir()
+        private.mkdir()
+        (private / "secret.txt").write_text("secret\n", encoding="utf-8")
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["allowed"], allowed_commands=[command]
+        )
+        calls = 0
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                nonlocal calls
+                calls += 1
+                allowed.rmdir()
+                allowed.symlink_to("private", target_is_directory=True)
+                return qwen_agent.CommandResult(0, "", "")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            agent.execute({"action": "run", "command": command})
+            with self.assertRaisesRegex(AgentError, "scope changed"):
+                agent.execute({"action": "run", "command": command})
+            with self.assertRaisesRegex(AgentError, "scope changed"):
+                agent.run_validation_command(qwen_agent._parse_command(command))
+
+        self.assertEqual(calls, 1)
+        self.assertEqual((private / "secret.txt").read_text(encoding="utf-8"), "secret\n")
+
+    def test_command_snapshot_limit_fails_before_execution(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        (generated / "one.txt").write_text("one\n", encoding="utf-8")
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["generated"], allowed_commands=[command]
+        )
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                raise AssertionError("command must not execute")
+
+        with mock.patch.object(qwen_agent, "MAX_COMMAND_TRACKED_FILES", 1), mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            with self.assertRaisesRegex(AgentError, "snapshot exceeds file limit"):
+                agent.execute({"action": "run", "command": command})
+
+    def test_command_snapshot_byte_limit_fails_before_execution(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        (generated / "one.txt").write_text("too large", encoding="utf-8")
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["generated"], allowed_commands=[command]
+        )
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                raise AssertionError("command must not execute")
+
+        with mock.patch.object(qwen_agent, "MAX_COMMAND_TRACKED_BYTES", 1), mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            with self.assertRaisesRegex(AgentError, "snapshot exceeds byte limit"):
+                agent.execute({"action": "run", "command": command})
 
     def test_command_sandbox_rejects_missing_executable(self):
         agent = SandboxAgent(
@@ -698,21 +903,26 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         bootstrap = f"import base64\nexec(base64.b64decode({encoded!r}))"
         return f"{shlex.quote(sys.executable)} -c {shlex.quote(bootstrap)}"
 
-    def _run_python(self, code: str, *, allow=None):
+    def _run_python(
+        self, code: str, *, allow=None, read_only=None, validation=False
+    ):
         command = self._python_command(code)
         agent = SandboxAgent(
             self.root,
             allow or ["input.txt"],
+            read_only=read_only or [],
             allowed_commands=[command],
         )
-        return agent.execute({"action": "run", "command": command})
+        if validation:
+            return agent.run_validation_command(qwen_agent._parse_command(command)), agent
+        return agent.execute({"action": "run", "command": command}), agent
 
     def test_outside_file_read_is_denied_without_secret_output(self):
         outside = self.root.parent / f"{self.root.name}-outside-secret.txt"
         outside.write_text("TOP_SECRET_SENTINEL\n", encoding="utf-8")
         self.addCleanup(outside.unlink, missing_ok=True)
 
-        result = self._run_python(
+        result, _agent = self._run_python(
             f"from pathlib import Path; print(Path({str(outside)!r}).read_text())"
         )
 
@@ -724,7 +934,7 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         outside = self.root.parent / f"{self.root.name}-outside-write.txt"
         self.addCleanup(outside.unlink, missing_ok=True)
 
-        result = self._run_python(
+        result, _agent = self._run_python(
             f"from pathlib import Path; Path({str(outside)!r}).write_text('outside')"
         )
 
@@ -737,7 +947,7 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         self.addCleanup(outside.unlink, missing_ok=True)
         (self.root / "link.txt").symlink_to(outside)
 
-        result = self._run_python(
+        result, _agent = self._run_python(
             "from pathlib import Path; print(Path('link.txt').read_text())"
         )
 
@@ -745,19 +955,250 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         self.assertNotIn("TOP_SECRET_SYMLINK_SENTINEL", result["stdout"])
         self.assertNotIn("TOP_SECRET_SYMLINK_SENTINEL", result["stderr"])
 
-    def test_sandbox_file_read_and_write_work(self):
-        result = self._run_python(
+    def test_out_of_scope_sandbox_read_is_denied_without_secret_output(self):
+        private = self.root / "private.txt"
+        private.write_text("PRIVATE_SENTINEL\n", encoding="utf-8")
+
+        result, _agent = self._run_python(
+            "from pathlib import Path; print(Path('private.txt').read_text())"
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("PRIVATE_SENTINEL", result["stdout"])
+        self.assertNotIn("PRIVATE_SENTINEL", result["stderr"])
+
+    def test_read_only_file_is_readable(self):
+        context = self.root / "context.txt"
+        context.write_text("READ_ONLY_SENTINEL\n", encoding="utf-8")
+
+        result, _agent = self._run_python(
+            "from pathlib import Path; print(Path('context.txt').read_text(), end='')",
+            read_only=["context.txt"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stdout"], "READ_ONLY_SENTINEL\n")
+
+    def test_read_only_file_write_is_denied(self):
+        context = self.root / "context.txt"
+        context.write_text("original\n", encoding="utf-8")
+
+        result, _agent = self._run_python(
+            "from pathlib import Path; Path('context.txt').write_text('changed')",
+            read_only=["context.txt"],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(context.read_bytes(), b"original\n")
+
+    def test_model_run_writable_file_modification_is_accounted(self):
+        result, agent = self._run_python(
+            "from pathlib import Path; Path('input.txt').write_text('changed')"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(self.input_path.read_text(encoding="utf-8"), "changed")
+        self.assertEqual(agent.changed_paths, {"input.txt"})
+        self.assertEqual(agent.mutation_generation, 1)
+
+    def test_model_run_multiple_mutations_advance_generation_once(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        (generated / "one.txt").write_text("one", encoding="utf-8")
+        (generated / "two.txt").write_text("two", encoding="utf-8")
+
+        result, agent = self._run_python(
             "from pathlib import Path; "
-            "data=Path('input.txt').read_text(); "
-            "Path('output.txt').write_text(data+'output'); print(data, end='')"
+            "Path('generated/one.txt').write_text('changed'); "
+            "Path('generated/two.txt').unlink(); "
+            "Path('generated/three.txt').write_text('created')",
+            allow=["generated"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(agent.mutation_generation, 1)
+        self.assertEqual(
+            agent.changed_paths,
+            {
+                "generated/one.txt",
+                "generated/two.txt",
+                "generated/three.txt",
+            },
+        )
+
+    def test_unauthorized_new_file_is_denied(self):
+        result, _agent = self._run_python(
+            "from pathlib import Path; Path('output.txt').write_text('unauthorized')"
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse((self.root / "output.txt").exists())
+
+    def test_writable_directory_allows_child_creation_only_inside_scope(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        result, _agent = self._run_python(
+            "from pathlib import Path; Path('generated/output.txt').write_text('ok')",
+            allow=["generated"],
+        )
+        denied, _agent = self._run_python(
+            "from pathlib import Path; Path('other.txt').write_text('denied')",
+            allow=["generated"],
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual((generated / "output.txt").read_text(encoding="utf-8"), "ok")
+        self.assertFalse(denied["ok"])
+        self.assertFalse((self.root / "other.txt").exists())
+
+    def test_forbidden_env_files_are_denied_inside_readable_directory(self):
+        source = self.root / "source"
+        nested = source / "nested"
+        nested.mkdir(parents=True)
+        (source / ".env").write_text("ENV_SENTINEL\n", encoding="utf-8")
+        (source / ".env.local").write_text("LOCAL_SENTINEL\n", encoding="utf-8")
+        (nested / ".env").write_text("NESTED_SENTINEL\n", encoding="utf-8")
+
+        for relative, sentinel in (
+            ("source/.env", "ENV_SENTINEL"),
+            ("source/.env.local", "LOCAL_SENTINEL"),
+            ("source/nested/.env", "NESTED_SENTINEL"),
+        ):
+            with self.subTest(relative=relative):
+                result, _agent = self._run_python(
+                    f"from pathlib import Path; print(Path({relative!r}).read_text())",
+                    read_only=["source"],
+                )
+
+                self.assertFalse(result["ok"])
+                self.assertNotIn(sentinel, result["stdout"])
+                self.assertNotIn(sentinel, result["stderr"])
+
+    def test_secret_basename_is_denied_inside_readable_directory(self):
+        config = self.root / "config"
+        config.mkdir()
+        (config / "secrets.json").write_text("SECRET_SENTINEL\n", encoding="utf-8")
+
+        result, _agent = self._run_python(
+            "from pathlib import Path; print(Path('config/secrets.json').read_text())",
+            read_only=["config"],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("SECRET_SENTINEL", result["stdout"])
+        self.assertNotIn("SECRET_SENTINEL", result["stderr"])
+
+    def test_intra_sandbox_symlink_bypass_is_denied(self):
+        allowed = self.root / "allowed"
+        allowed.mkdir()
+        private = self.root / "private.txt"
+        private.write_text("SYMLINK_SECRET\n", encoding="utf-8")
+        (allowed / "link.txt").symlink_to(Path("..") / "private.txt")
+
+        result, _agent = self._run_python(
+            "from pathlib import Path; print(Path('allowed/link.txt').read_text())",
+            read_only=["allowed"],
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertNotIn("SYMLINK_SECRET", result["stdout"])
+        self.assertNotIn("SYMLINK_SECRET", result["stderr"])
+
+    def test_rebound_directory_scope_is_rejected_for_model_and_validation(self):
+        allowed = self.root / "allowed"
+        private = self.root / "private"
+        allowed.mkdir()
+        private.mkdir()
+        (private / "secret.txt").write_text("REBIND_SECRET\n", encoding="utf-8")
+        rebind_command = self._python_command(
+            "from pathlib import Path; Path('allowed').rmdir(); "
+            "Path('allowed').symlink_to('private', target_is_directory=True)"
+        )
+        read_command = self._python_command(
+            "from pathlib import Path; print(Path('allowed/secret.txt').read_text())"
+        )
+        agent = SandboxAgent(
+            self.root,
+            ["allowed"],
+            allowed_commands=[rebind_command, read_command],
+        )
+
+        first = agent.execute({"action": "run", "command": rebind_command})
+        self.assertTrue(first["ok"])
+        with self.assertRaisesRegex(AgentError, "scope changed"):
+            agent.execute({"action": "run", "command": read_command})
+        with self.assertRaisesRegex(AgentError, "scope changed"):
+            agent.run_validation_command(qwen_agent._parse_command(read_command))
+        self.assertEqual(
+            (private / "secret.txt").read_text(encoding="utf-8"),
+            "REBIND_SECRET\n",
+        )
+
+    def test_validation_source_write_is_denied(self):
+        result, agent = self._run_python(
+            "from pathlib import Path; Path('input.txt').write_text('changed')",
+            validation=True,
+        )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.input_path.read_text(encoding="utf-8"), "inside sentinel\n")
+        policy = agent._command_access_policy(Path("/tmp"), validation=True)
+        self.assertTrue(policy.validation)
+        self.assertEqual(policy.writable_paths, ())
+
+    def test_validation_read_works(self):
+        result, _agent = self._run_python(
+            "from pathlib import Path; print(Path('input.txt').read_text(), end='')",
+            validation=True,
         )
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["stdout"], "inside sentinel\n")
-        self.assertEqual(
-            (self.root / "output.txt").read_text(encoding="utf-8"),
-            "inside sentinel\noutput",
+
+    def test_command_scratch_is_writable_without_project_mutation(self):
+        result, agent = self._run_python(
+            "import os; from pathlib import Path; "
+            "(Path(os.environ['TMPDIR']) / 'runtime-cache').write_text('cache')"
         )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(agent.changed_paths, set())
+        self.assertEqual(sorted(path.name for path in self.root.iterdir()), ["input.txt"])
+
+    def test_command_scratch_path_is_not_returned_to_model(self):
+        result, _agent = self._run_python(
+            "import os; print(os.environ['TMPDIR'])"
+        )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["stdout"], "[command scratch]\n")
+
+    def test_command_scratch_is_cleaned_up(self):
+        created: list[Path] = []
+
+        class RecordingTemporaryDirectory:
+            def __init__(self, *args, **kwargs):
+                self.path = Path(tempfile.mkdtemp(*args, **kwargs))
+                created.append(self.path)
+
+            def __enter__(self):
+                return str(self.path)
+
+            def __exit__(self, _type, _value, _traceback):
+                shutil.rmtree(self.path)
+                return False
+
+        with mock.patch.object(
+            qwen_agent.tempfile, "TemporaryDirectory", RecordingTemporaryDirectory
+        ):
+            result, _agent = self._run_python(
+                "import os; from pathlib import Path; "
+                "(Path(os.environ['TMPDIR']) / 'runtime-cache').write_text('cache')"
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(len(created), 1)
+        self.assertFalse(created[0].exists())
 
     def test_network_connection_is_denied(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -766,7 +1207,7 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         listener.listen(1)
         port = listener.getsockname()[1]
 
-        result = self._run_python(
+        result, _agent = self._run_python(
             "import socket; "
             f"socket.create_connection(('127.0.0.1', {port}), timeout=2); "
             "print('CONNECTED')"
@@ -779,7 +1220,7 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
             listener.accept()
 
     def test_command_output_is_bounded(self):
-        result = self._run_python(
+        result, _agent = self._run_python(
             "import sys; print('o'*100000); print('e'*100000, file=sys.stderr)"
         )
 
@@ -1328,6 +1769,7 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.validation_commands, 1)
         self.assertEqual(result.validation_rounds, 1)
         self.assertEqual(len(fake_sandbox.calls), 1)
+        self.assertTrue(fake_sandbox.calls[0][1]["access_policy"].validation)
 
     async def test_validation_failure_is_feedback_for_the_next_model_turn(self):
         messages = []
@@ -1436,6 +1878,8 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_sandbox.calls), 2)
         self.assertEqual(fake_sandbox.calls[0][0][1], "status")
         self.assertEqual(fake_sandbox.calls[1][0][1], "diff")
+        self.assertFalse(fake_sandbox.calls[0][1]["access_policy"].validation)
+        self.assertTrue(fake_sandbox.calls[1][1]["access_policy"].validation)
 
     async def test_multiple_validation_commands_stop_at_second_failure(self):
         with self.assertRaisesRegex(RuntimeError, "AGENT_ACTION_LIMIT"):

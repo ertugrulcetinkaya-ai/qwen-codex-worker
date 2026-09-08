@@ -7,6 +7,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import selectors
 import shlex
 import shutil
@@ -90,6 +91,8 @@ MAX_ACTION_TEXT_CHARS = MAX_AGENT_FINAL_CONTENT_CHARS
 MAX_ACTION_TEXT_BYTES = MAX_AGENT_FINAL_CONTENT_BYTES
 MAX_COMMAND_OUTPUT_CHARS = 8_000
 COMMAND_TIMEOUT_SECONDS = 120
+MAX_COMMAND_TRACKED_FILES = 1_024
+MAX_COMMAND_TRACKED_BYTES = 8_000_000
 # These limits count Python characters in the model messages, including the
 # system prompt, stable base context, compact state, and recent interactions.
 MAX_AGENT_HISTORY_CHARS = 200_000
@@ -651,6 +654,30 @@ class CommandResult:
 
 
 @dataclass(frozen=True)
+class CommandPathScope:
+    """A canonical project path granted to a command sandbox."""
+
+    path: Path
+    is_directory: bool
+
+
+@dataclass(frozen=True)
+class CommandAccessPolicy:
+    """Explicit project and scratch authority for one command invocation."""
+
+    readable_paths: tuple[CommandPathScope, ...]
+    writable_paths: tuple[CommandPathScope, ...]
+    scratch_path: Path
+    validation: bool
+
+
+@dataclass(frozen=True)
+class _CommandPathSnapshot:
+    kind: str
+    digest: str | None = None
+
+
+@dataclass(frozen=True)
 class AgentResult:
     status: str
     actions: int
@@ -780,6 +807,12 @@ class SandboxAgent:
         )
         if not self.writable_scopes:
             raise AgentError("at least one --allow path is required")
+        self._writable_command_scopes = self._initial_command_scope_paths(
+            self.writable_scopes
+        )
+        self._readable_command_scopes = self._initial_command_scope_paths(
+            self.readable_scopes
+        )
         self.allowed_commands = tuple(
             self._parse_allowed_command(command) for command in allowed_commands
         )
@@ -1245,27 +1278,195 @@ class SandboxAgent:
             "bytes": len(content.encode("utf-8")),
         }
 
-    def _run_action(self, action: dict[str, Any]) -> dict[str, Any]:
-        command = action.get("command")
-        argv = _parse_command(command)
-        if not _command_allowed(argv, self.allowed_commands):
-            raise AgentError(f"command is not allowlisted: {command}")
+    def _initial_command_scope_paths(
+        self, scopes: tuple[tuple[str, bool], ...]
+    ) -> tuple[CommandPathScope, ...]:
+        command_scopes: list[CommandPathScope] = []
+        seen: set[tuple[Path, bool]] = set()
+        for relative, is_directory in scopes:
+            try:
+                resolved = (self.root / relative).resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise AgentError("command scope could not be resolved") from exc
+            if not _within(self.root, resolved):
+                raise AgentError("command scope escapes sandbox")
+            scope = CommandPathScope(resolved, is_directory)
+            key = (scope.path, scope.is_directory)
+            if key not in seen:
+                seen.add(key)
+                command_scopes.append(scope)
+        return tuple(command_scopes)
+
+    @staticmethod
+    def _command_scope_paths(
+        scopes: tuple[CommandPathScope, ...]
+    ) -> tuple[CommandPathScope, ...]:
+        for scope in scopes:
+            try:
+                current = scope.path.resolve(strict=False)
+            except (OSError, RuntimeError) as exc:
+                raise AgentError("command scope could not be resolved") from exc
+            if current != scope.path:
+                raise AgentError("command scope changed since authorization")
+        return scopes
+
+    def _command_access_policy(
+        self, scratch_path: Path, *, validation: bool
+    ) -> CommandAccessPolicy:
+        return CommandAccessPolicy(
+            readable_paths=self._command_scope_paths(
+                self._readable_command_scopes
+            ),
+            writable_paths=(
+                ()
+                if validation
+                else self._command_scope_paths(self._writable_command_scopes)
+            ),
+            scratch_path=scratch_path,
+            validation=validation,
+        )
+
+    def _snapshot_writable_state(self) -> dict[str, _CommandPathSnapshot]:
+        snapshots: dict[str, _CommandPathSnapshot] = {}
+        tracked_bytes = 0
+
+        def record(relative: str, path: Path, *, recurse: bool) -> None:
+            nonlocal tracked_bytes
+            if relative in snapshots:
+                return
+            if len(snapshots) >= MAX_COMMAND_TRACKED_FILES:
+                raise AgentError("command mutation snapshot exceeds file limit")
+            try:
+                observed = path.lstat()
+            except FileNotFoundError:
+                snapshots[relative] = _CommandPathSnapshot("missing")
+                return
+            except OSError as exc:
+                raise AgentError("command mutation snapshot could not inspect path") from exc
+
+            mode = stat.S_IFMT(observed.st_mode)
+            permissions = stat.S_IMODE(observed.st_mode)
+            if stat.S_ISREG(mode):
+                if observed.st_size > MAX_COMMAND_TRACKED_BYTES - tracked_bytes:
+                    raise AgentError("command mutation snapshot exceeds byte limit")
+                try:
+                    data = read_bounded_file(
+                        path,
+                        MAX_COMMAND_TRACKED_BYTES - tracked_bytes,
+                        field="command mutation snapshot",
+                        code="COMMAND_SNAPSHOT_TOO_LARGE",
+                    )
+                except (InputLimitError, OSError) as exc:
+                    raise AgentError(
+                        "command mutation snapshot exceeds byte limit"
+                    ) from exc
+                tracked_bytes += len(data)
+                snapshots[relative] = _CommandPathSnapshot(
+                    f"file:{permissions:o}", hashlib.sha256(data).hexdigest()
+                )
+                return
+            if stat.S_ISLNK(mode):
+                try:
+                    target = os.readlink(path)
+                except OSError as exc:
+                    raise AgentError(
+                        "command mutation snapshot could not inspect symlink"
+                    ) from exc
+                snapshots[relative] = _CommandPathSnapshot(
+                    "symlink", hashlib.sha256(os.fsencode(target)).hexdigest()
+                )
+                return
+            if stat.S_ISDIR(mode):
+                snapshots[relative] = _CommandPathSnapshot(
+                    f"directory:{permissions:o}"
+                )
+                if not recurse:
+                    return
+                try:
+                    children = sorted(path.iterdir(), key=lambda child: child.name)
+                except OSError as exc:
+                    raise AgentError(
+                        "command mutation snapshot could not scan directory"
+                ) from exc
+                for child in children:
+                    record(f"{relative}/{child.name}", child, recurse=True)
+                return
+            snapshots[relative] = _CommandPathSnapshot(f"special:{mode:o}")
+
+        for relative, is_directory in sorted(self.writable_scopes):
+            record(relative, self.root / relative, recurse=is_directory)
+        return snapshots
+
+    def _record_command_mutations(
+        self,
+        before: dict[str, _CommandPathSnapshot],
+        after: dict[str, _CommandPathSnapshot],
+    ) -> None:
+        changed = {
+            relative
+            for relative in set(before) | set(after)
+            if before.get(relative) != after.get(relative)
+        }
+        if changed:
+            self._invalidate_all_observations()
+            self.changed_paths.update(changed)
+            self.mutation_generation += 1
+
+    def _run_command_argv(
+        self, argv: tuple[str, ...], *, validation: bool
+    ) -> dict[str, Any]:
         executable = _resolve_command_executable(argv[0], self.root)
         sandbox = _discover_command_sandbox()
-        completed = sandbox.run(
-            (str(executable), *argv[1:]),
-            sandbox_root=self.root,
-            environment=_safe_environment(self.root),
-            timeout=COMMAND_TIMEOUT_SECONDS,
-        )
+        before = None if validation else self._snapshot_writable_state()
+        try:
+            with tempfile.TemporaryDirectory(prefix="qwen-command-") as directory:
+                scratch_path = Path(directory).resolve(strict=True)
+                access_policy = self._command_access_policy(
+                    scratch_path, validation=validation
+                )
+                completed = sandbox.run(
+                    (str(executable), *argv[1:]),
+                    sandbox_root=self.root,
+                    access_policy=access_policy,
+                    environment=_safe_environment(scratch_path),
+                    timeout=COMMAND_TIMEOUT_SECONDS,
+                )
+        finally:
+            if before is not None:
+                try:
+                    self._record_command_mutations(
+                        before, self._snapshot_writable_state()
+                    )
+                except AgentError:
+                    # A post-command tracking failure must invalidate validation
+                    # state instead of allowing an unobserved project mutation.
+                    self._invalidate_all_observations()
+                    self.mutation_generation += 1
+                    raise
         return {
             "ok": completed.returncode == 0,
             "action": "run",
             "command": " ".join(argv),
             "returncode": completed.returncode,
-            "stdout": completed.stdout[-MAX_COMMAND_OUTPUT_CHARS:],
-            "stderr": completed.stderr[-MAX_COMMAND_OUTPUT_CHARS:],
+            "stdout": _redact_command_scratch(
+                completed.stdout, scratch_path
+            )[-MAX_COMMAND_OUTPUT_CHARS:],
+            "stderr": _redact_command_scratch(
+                completed.stderr, scratch_path
+            )[-MAX_COMMAND_OUTPUT_CHARS:],
         }
+
+    def _run_action(self, action: dict[str, Any]) -> dict[str, Any]:
+        command = action.get("command")
+        argv = _parse_command(command)
+        if not _command_allowed(argv, self.allowed_commands):
+            raise AgentError(f"command is not allowlisted: {command}")
+        return self._run_command_argv(argv, validation=False)
+
+    def run_validation_command(self, argv: tuple[str, ...]) -> dict[str, Any]:
+        if not _command_allowed(argv, self.allowed_commands):
+            raise AgentError("validation command is not allowlisted")
+        return self._run_command_argv(argv, validation=True)
 
     def execute(self, action: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(action, dict):
@@ -1307,7 +1508,7 @@ class ValidationRunner:
         for index, argv in enumerate(self.policy.commands, 1):
             command = shlex.join(argv)
             try:
-                raw = self.agent.execute({"action": "run", "command": command})
+                raw = self.agent.run_validation_command(argv)
                 returncode = raw.get("returncode")
                 if isinstance(returncode, bool) or not isinstance(returncode, int):
                     returncode = 1
@@ -1534,21 +1735,26 @@ def _trusted_command_paths() -> tuple[Path, ...]:
     return tuple(paths)
 
 
-def _safe_environment(sandbox_root: Path | None = None) -> dict[str, str]:
+def _safe_environment(scratch_path: Path | None = None) -> dict[str, str]:
     environment = {
         "PATH": os.pathsep.join(str(path) for path in _trusted_command_paths()),
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
     }
-    if sandbox_root is not None:
+    if scratch_path is not None:
         environment.update(
             {
-                "HOME": str(sandbox_root),
-                "TMPDIR": str(sandbox_root),
+                "HOME": str(scratch_path),
+                "TMPDIR": str(scratch_path),
+                "PYTHONPYCACHEPREFIX": str(scratch_path / "pycache"),
                 "PYTHONNOUSERSITE": "1",
             }
         )
     return environment
+
+
+def _redact_command_scratch(output: str, scratch_path: Path) -> str:
+    return output.replace(str(scratch_path), "[command scratch]")
 
 
 def _resolve_command_executable(argv0: str, sandbox_root: Path) -> Path:
@@ -1558,7 +1764,7 @@ def _resolve_command_executable(argv0: str, sandbox_root: Path) -> Path:
             candidate = sandbox_root / candidate
     else:
         selected = shutil.which(
-            argv0, path=_safe_environment(sandbox_root)["PATH"]
+            argv0, path=_safe_environment()["PATH"]
         )
         if selected is None:
             raise AgentError("command executable was not found")
@@ -1574,6 +1780,40 @@ def _resolve_command_executable(argv0: str, sandbox_root: Path) -> Path:
 
 def _sbpl_parameter(name: str) -> str:
     return f'(param "{name}")'
+
+
+def _sbpl_regex(pattern: str) -> str:
+    return "#" + json.dumps(pattern)
+
+
+def _forbidden_command_path_regex(sandbox_root: Path) -> str:
+    def insensitive(value: str) -> str:
+        parts: list[str] = []
+        for character in value:
+            if character.isascii() and character.isalpha():
+                parts.append(f"[{character.lower()}{character.upper()}]")
+            else:
+                parts.append(re.escape(character))
+        return "".join(parts)
+
+    root = str(sandbox_root).rstrip("/") or "/"
+    separator = "" if root == "/" else "/"
+    components = "|".join(
+        [r"\.[eE][nN][vV][^/]*"]
+        + [insensitive(name) for name in sorted(FORBIDDEN_BASENAMES)]
+    )
+    # The root is escaped before it becomes a profile regular expression; all
+    # filename matching is static rather than derived from caller path input.
+    return (
+        f"^{re.escape(root)}{separator}([^/]+/)*({components})(/.*)?$"
+    )
+
+
+def _command_scope_predicate(
+    parameter: str, scope: CommandPathScope
+) -> str:
+    operation = "subpath" if scope.is_directory else "literal"
+    return f"({operation} {parameter})"
 
 
 def _macos_runtime_paths(executable: Path) -> tuple[Path, ...]:
@@ -1609,12 +1849,16 @@ def _macos_runtime_paths(executable: Path) -> tuple[Path, ...]:
 
 
 def _macos_sandbox_profile(
-    sandbox_root: Path, executable: Path
+    sandbox_root: Path,
+    executable: Path,
+    access_policy: CommandAccessPolicy,
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
     parameters: list[tuple[str, str]] = [
         ("SANDBOX_ROOT", str(sandbox_root)),
         ("EXECUTABLE", str(executable)),
+        ("SCRATCH", str(access_policy.scratch_path)),
     ]
+    forbidden = _sbpl_regex(_forbidden_command_path_regex(sandbox_root))
     rules = [
         "(version 1)",
         "(deny default)",
@@ -1623,15 +1867,32 @@ def _macos_sandbox_profile(
         '(import "system.sb")',
         "(allow process-fork)",
         "(allow signal)",
-        f"(allow file-read* file-map-executable (subpath {_sbpl_parameter('SANDBOX_ROOT')}))",
-        f"(allow file-write* (subpath {_sbpl_parameter('SANDBOX_ROOT')}))",
-        f"(allow process-exec (subpath {_sbpl_parameter('SANDBOX_ROOT')}))",
-        f"(allow process-exec-interpreter (subpath {_sbpl_parameter('SANDBOX_ROOT')}))",
         f"(allow file-read-metadata file-test-existence (path-ancestors {_sbpl_parameter('SANDBOX_ROOT')}))",
         f"(allow file-read* file-map-executable (literal {_sbpl_parameter('EXECUTABLE')}))",
         f"(allow process-exec (literal {_sbpl_parameter('EXECUTABLE')}))",
         f"(allow file-read-metadata file-test-existence (path-ancestors {_sbpl_parameter('EXECUTABLE')}))",
+        f"(allow file-read* file-map-executable (subpath {_sbpl_parameter('SCRATCH')}))",
+        f"(allow file-write* (subpath {_sbpl_parameter('SCRATCH')}))",
+        f"(allow file-read-metadata file-test-existence (path-ancestors {_sbpl_parameter('SCRATCH')}))",
     ]
+    for access, scopes in (
+        ("READABLE", access_policy.readable_paths),
+        ("WRITABLE", access_policy.writable_paths),
+    ):
+        for index, scope in enumerate(scopes):
+            parameter_name = f"{access}_{index}"
+            parameters.append((parameter_name, str(scope.path)))
+            parameter = _sbpl_parameter(parameter_name)
+            predicate = _command_scope_predicate(parameter, scope)
+            if access == "READABLE":
+                rules.append(
+                    f"(allow file-read* file-map-executable {predicate})"
+                )
+            else:
+                rules.append(f"(allow file-write* {predicate})")
+            rules.append(
+                f"(allow file-read-metadata file-test-existence (path-ancestors {parameter}))"
+            )
     for index, path in enumerate(_macos_runtime_paths(executable)):
         parameter_name = f"RUNTIME_{index}"
         parameters.append((parameter_name, str(path)))
@@ -1644,6 +1905,14 @@ def _macos_sandbox_profile(
                 f"(allow file-read-metadata file-test-existence (path-ancestors {parameter}))",
             ]
         )
+    # Seatbelt resolves overlapping rules in declaration order, so these
+    # explicit secret denials must follow directory-level scope allowances.
+    rules.extend(
+        [
+            f"(deny file-read* {forbidden})",
+            f"(deny file-write* {forbidden})",
+        ]
+    )
     return "\n".join(rules), tuple(parameters)
 
 
@@ -1737,6 +2006,7 @@ class CommandSandbox:
         argv: tuple[str, ...],
         *,
         sandbox_root: Path,
+        access_policy: CommandAccessPolicy,
         environment: dict[str, str],
         timeout: float,
     ) -> CommandResult:
@@ -1767,8 +2037,14 @@ class MacOSCommandSandbox(CommandSandbox):
             raise AgentError("command sandbox is unavailable")
         with tempfile.TemporaryDirectory(prefix="qwen-sandbox-probe-") as directory:
             probe_root = Path(directory).resolve(strict=True)
+            probe_policy = CommandAccessPolicy(
+                readable_paths=(),
+                writable_paths=(),
+                scratch_path=probe_root,
+                validation=False,
+            )
             profile, parameters = _macos_sandbox_profile(
-                probe_root, true_executable
+                probe_root, true_executable, probe_policy
             )
             command = [str(resolved)]
             for name, value in parameters:
@@ -1797,11 +2073,14 @@ class MacOSCommandSandbox(CommandSandbox):
         argv: tuple[str, ...],
         *,
         sandbox_root: Path,
+        access_policy: CommandAccessPolicy,
         environment: dict[str, str],
         timeout: float,
     ) -> CommandResult:
         executable = Path(argv[0])
-        profile, parameters = _macos_sandbox_profile(sandbox_root, executable)
+        profile, parameters = _macos_sandbox_profile(
+            sandbox_root, executable, access_policy
+        )
         command = [str(self.sandbox_exec)]
         for name, value in parameters:
             command.extend(["-D", f"{name}={value}"])

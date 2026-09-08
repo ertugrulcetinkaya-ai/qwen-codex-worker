@@ -131,6 +131,16 @@ sandbox, with at most three validation rounds. A subsequent `done` after any
 successful `replace` or `write` mutation runs the required validation again;
 model-selected `run` results are never treated as proof of completion.
 
+Commands use the macOS `sandbox-exec` backend fail-closed when it is available.
+Model-selected `run` commands can read only the declared readable scopes and
+trusted runtime paths, write only declared writable scopes, have network access
+denied, cannot access `.env*` or configured secret basenames, and receive a
+per-invocation scratch directory for temporary state. Host validation commands
+use the same parser and exact argv allowlist, but the project tree is read-only:
+they can read only declared readable scopes and can write only to their dedicated
+scratch directory. Command-created changes inside writable project scopes are
+recorded before validation; scratch state is removed after each invocation.
+
 Agent model context is deterministic and character-bounded: it keeps the stable
 task/scopes context, metadata-only filesystem state, and at most six recent
 interactions within a 200,000-character message budget. Authorization state
