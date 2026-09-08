@@ -511,8 +511,12 @@ class SandboxActionTests(unittest.TestCase):
             str(self.root / "config" / "secrets.json"), re.compile(pattern)
         )
         self.assertNotRegex(str(self.root / "example.txt"), re.compile(pattern))
-        self.assertIn("(deny file-read* #", profile)
-        self.assertIn("(deny file-write* #", profile)
+        self.assertIn(
+            '(deny file-read* (regex (string-append "^"', profile
+        )
+        self.assertIn(
+            '(deny file-write* (regex (string-append "^"', profile
+        )
         self.assertNotIn(
             '(allow file-write* (subpath (param "SANDBOX_ROOT")))', profile
         )
@@ -1197,8 +1201,9 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
             )
 
         self.assertTrue(result["ok"])
-        self.assertEqual(len(created), 1)
-        self.assertFalse(created[0].exists())
+        # discover() also uses a temporary directory for its backend probe.
+        self.assertEqual(len(created), 2)
+        self.assertTrue(all(not path.exists() for path in created))
 
     def test_network_connection_is_denied(self):
         listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

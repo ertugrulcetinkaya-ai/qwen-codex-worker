@@ -1782,11 +1782,14 @@ def _sbpl_parameter(name: str) -> str:
     return f'(param "{name}")'
 
 
-def _sbpl_regex(pattern: str) -> str:
-    return "#" + json.dumps(pattern)
+def _sbpl_hash_string(value: str) -> str:
+    if any(character in value for character in ('"', "\n", "\r")):
+        raise AgentError("SBPL static string contains an unsupported character")
+    encoded = json.dumps(value).replace("\\\\", "\\")
+    return f"#{encoded}"
 
 
-def _forbidden_command_path_regex(sandbox_root: Path) -> str:
+def _forbidden_command_path_components() -> str:
     def insensitive(value: str) -> str:
         parts: list[str] = []
         for character in value:
@@ -1796,16 +1799,34 @@ def _forbidden_command_path_regex(sandbox_root: Path) -> str:
                 parts.append(re.escape(character))
         return "".join(parts)
 
-    root = str(sandbox_root).rstrip("/") or "/"
-    separator = "" if root == "/" else "/"
-    components = "|".join(
+    return "|".join(
         [r"\.[eE][nN][vV][^/]*"]
         + [insensitive(name) for name in sorted(FORBIDDEN_BASENAMES)]
     )
+
+
+def _forbidden_command_path_suffix() -> str:
+    return f"([^/]+/)*({_forbidden_command_path_components()})(/.*)?$"
+
+
+def _forbidden_command_path_regex(sandbox_root: Path) -> str:
+    root = str(sandbox_root).rstrip("/") or "/"
+    separator = "" if root == "/" else "/"
     # The root is escaped before it becomes a profile regular expression; all
     # filename matching is static rather than derived from caller path input.
+    return f"^{re.escape(root)}{separator}{_forbidden_command_path_suffix()}"
+
+
+def _sbpl_forbidden_command_path_filter(sandbox_root: Path) -> str:
+    root = str(sandbox_root).rstrip("/") or "/"
+    separator = "" if root == "/" else "/"
+    suffix = f"{separator}{_forbidden_command_path_suffix()}"
+    # Keep the caller-selected root in a parameter and quote it in SBPL. This
+    # handles valid paths containing regex or SBPL-special characters safely.
     return (
-        f"^{re.escape(root)}{separator}([^/]+/)*({components})(/.*)?$"
+        f'(regex (string-append "^" '
+        f'(regex-quote {_sbpl_parameter("SANDBOX_ROOT")}) '
+        f"{_sbpl_hash_string(suffix)}))"
     )
 
 
@@ -1858,7 +1879,7 @@ def _macos_sandbox_profile(
         ("EXECUTABLE", str(executable)),
         ("SCRATCH", str(access_policy.scratch_path)),
     ]
-    forbidden = _sbpl_regex(_forbidden_command_path_regex(sandbox_root))
+    forbidden = _sbpl_forbidden_command_path_filter(sandbox_root)
     rules = [
         "(version 1)",
         "(deny default)",
@@ -1868,6 +1889,9 @@ def _macos_sandbox_profile(
         "(allow process-fork)",
         "(allow signal)",
         f"(allow file-read-metadata file-test-existence (path-ancestors {_sbpl_parameter('SANDBOX_ROOT')}))",
+        # Interpreters inspect their current working directory during startup;
+        # grant access to the directory object itself, not its children.
+        f"(allow file-read-data file-read-metadata (literal {_sbpl_parameter('SANDBOX_ROOT')}))",
         f"(allow file-read* file-map-executable (literal {_sbpl_parameter('EXECUTABLE')}))",
         f"(allow process-exec (literal {_sbpl_parameter('EXECUTABLE')}))",
         f"(allow file-read-metadata file-test-existence (path-ancestors {_sbpl_parameter('EXECUTABLE')}))",
@@ -1905,8 +1929,8 @@ def _macos_sandbox_profile(
                 f"(allow file-read-metadata file-test-existence (path-ancestors {parameter}))",
             ]
         )
-    # Seatbelt resolves overlapping rules in declaration order, so these
-    # explicit secret denials must follow directory-level scope allowances.
+    # SBPL uses the last matching rule; keep these denials after all declared
+    # directory allowances so they cannot be overridden by a readable scope.
     rules.extend(
         [
             f"(deny file-read* {forbidden})",
