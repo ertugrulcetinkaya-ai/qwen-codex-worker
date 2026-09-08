@@ -8,12 +8,19 @@ import unittest
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
+from qwen_input_limits import (
+    MAX_MODEL_INPUT_CHARS,
+    MAX_PATH_CHARS,
+    MAX_REQUEST_BYTES,
+    MAX_SOURCE_FILES,
+)
 from qwen_worker_server import (
     DEFAULT_MODEL,
     MAX_SOURCE_CHARS,
+    MAX_TASK_CHARS,
+    MAX_TEST_OUTPUT_CHARS,
     _read_supplied_files,
 )
-
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 QWEN_PATCH = PROJECT_ROOT / "qwen-patch"
@@ -55,6 +62,23 @@ class _QwenHandler(BaseHTTPRequestHandler):
         pass
 
 
+class _ProxyHandler(BaseHTTPRequestHandler):
+    def _reject(self):
+        self.server.request_count += 1
+        body = b"proxy must not receive model traffic"
+        self.send_response(502)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    do_CONNECT = _reject
+    do_GET = _reject
+    do_POST = _reject
+
+    def log_message(self, format, *args):
+        pass
+
+
 class MockQwenServer:
     def __init__(self, final_text=None, status=200, raw_body=None, model=DEFAULT_MODEL):
         if raw_body is None:
@@ -84,6 +108,27 @@ class MockQwenServer:
         return f"http://{host}:{port}/v1"
 
 
+class MockProxy:
+    def __init__(self):
+        self.server = ThreadingHTTPServer(("127.0.0.1", 0), _ProxyHandler)
+        self.server.request_count = 0
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join()
+
+    @property
+    def base_url(self):
+        host, port = self.server.server_address
+        return f"http://{host}:{port}"
+
+
 class CliIntegrationTests(unittest.TestCase):
     def setUp(self):
         self.temporary_directory = tempfile.TemporaryDirectory()
@@ -101,10 +146,13 @@ class CliIntegrationTests(unittest.TestCase):
             "files": ["example.txt"],
         }
 
-    def invoke(self, request_bytes=None, arguments=(), base_url=None):
+    def invoke(
+        self, request_bytes=None, arguments=(), base_url=None, environment_overrides=None
+    ):
         environment = os.environ.copy()
         if base_url is not None:
             environment["QWEN_BASE_URL"] = base_url
+        environment.update(environment_overrides or {})
         return subprocess.run(
             [str(QWEN_PATCH), *arguments],
             input=request_bytes,
@@ -132,7 +180,51 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(qwen.server.post_count, 1)
         self.assertEqual(qwen.server.last_request["model"], DEFAULT_MODEL)
         self.assertIs(qwen.server.last_request["stream"], True)
-        self.assertIn("alpha\n", qwen.server.last_request["messages"][1]["content"])
+        prompt = qwen.server.last_request["messages"][1]["content"]
+        self.assertIn("alpha\n", prompt)
+        self.assertIn("example.txt", prompt)
+        self.assertNotIn(str(self.repo_root), prompt)
+
+    def test_unauthorized_structurally_valid_patch_fails_without_mutation(self):
+        diff = "--- a/other.txt\n+++ b/other.txt\n@@ -1 +1 @@\n-old\n+new\n"
+        original = self.source.read_bytes()
+        with MockQwenServer(diff) as qwen:
+            result = self.invoke(
+                json.dumps(self.request()).encode("utf-8"), base_url=qwen.base_url
+            )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"PATCH_TARGET_NOT_ALLOWED", result.stderr)
+        self.assertEqual(self.source.read_bytes(), original)
+        self.assertEqual(qwen.server.post_count, 1)
+
+    def test_local_model_traffic_bypasses_proxy_environment(self):
+        diff = "--- example.txt\n+++ example.txt\n@@ -1 +1 @@\n-alpha\n+beta\n"
+        with MockQwenServer(diff) as qwen, MockProxy() as proxy:
+            proxy_environment = {
+                name: proxy.base_url
+                for name in (
+                    "HTTP_PROXY",
+                    "HTTPS_PROXY",
+                    "ALL_PROXY",
+                    "http_proxy",
+                    "https_proxy",
+                    "all_proxy",
+                )
+            }
+            proxy_environment.update({"NO_PROXY": "", "no_proxy": ""})
+            result = self.invoke(
+                json.dumps(self.request()).encode("utf-8"),
+                base_url=qwen.base_url,
+                environment_overrides=proxy_environment,
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, diff.encode("utf-8"))
+        self.assertEqual(qwen.server.get_count, 1)
+        self.assertEqual(qwen.server.post_count, 1)
+        self.assertEqual(proxy.server.request_count, 0)
 
     def test_request_file(self):
         response = "NEED_FILES:\nother.txt"
@@ -147,6 +239,25 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertEqual(result.stdout, f"{response}\n".encode("utf-8"))
         self.assertEqual(result.stderr, b"")
+
+    def test_oversized_request_file_is_rejected_before_model(self):
+        request_path = self.repo_root / "oversized-request.json"
+        request_path.write_bytes(b"x" * (MAX_REQUEST_BYTES + 1))
+        result = self.invoke(arguments=("--request-file", str(request_path)))
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"REQUEST_TOO_LARGE", result.stderr)
+
+    def test_oversized_stdin_is_rejected_before_model(self):
+        result = self.invoke(
+            b"x" * (MAX_REQUEST_BYTES + 1),
+            environment_overrides={"QWEN_BASE_URL": "http://127.0.0.1:1/v1"},
+        )
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"REQUEST_TOO_LARGE", result.stderr)
 
     def test_missing_terminal_newline_is_canonicalized_for_git(self):
         diff = "--- example.txt\n+++ example.txt\n@@ -1 +1 @@\n-alpha\n+beta"
@@ -292,6 +403,74 @@ class SharedFileSafetyTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "character limit"):
             _read_supplied_files(str(self.root), ["large.txt"])
+
+    def test_source_path_length_is_enforced_before_filesystem_access(self):
+        with self.assertRaisesRegex(ValueError, "PATH_TOO_LONG"):
+            _read_supplied_files(str(self.root), ["x" * (MAX_PATH_CHARS + 1)])
+
+
+class PatchRequestBudgetTests(unittest.TestCase):
+    @staticmethod
+    def request(**updates):
+        request = {
+            "task": "change the supplied file",
+            "repo_root": "/tmp/repo",
+            "files": ["example.txt"],
+        }
+        request.update(updates)
+        return request
+
+    def test_parser_rejects_global_request_limit_before_json(self):
+        raw = b"{" + b"x" * MAX_REQUEST_BYTES
+        with self.assertRaisesRegex(Exception, "REQUEST_TOO_LARGE"):
+            from qwen_patch_cli import _parse_request
+
+            _parse_request(raw)
+
+    def test_parser_rejects_task_test_output_and_file_cardinality_limits(self):
+        from qwen_patch_cli import _parse_request
+
+        cases = (
+            ("task", "x" * (MAX_TASK_CHARS + 1), "TASK_TOO_LARGE"),
+            (
+                "test_output",
+                "x" * (MAX_TEST_OUTPUT_CHARS + 1),
+                "TEST_OUTPUT_TOO_LARGE",
+            ),
+            (
+                "files",
+                ["file.txt"] * (MAX_SOURCE_FILES + 1),
+                "TOO_MANY_FILES",
+            ),
+        )
+        for field, value, code in cases:
+            with self.subTest(field=field), self.assertRaisesRegex(Exception, code):
+                _parse_request(json.dumps(self.request(**{field: value})).encode())
+
+    def test_exact_request_boundary_and_invalid_utf8(self):
+        from qwen_patch_cli import _parse_request
+
+        raw = json.dumps(self.request(), separators=(",", ":")).encode()
+        raw += b" " * (MAX_REQUEST_BYTES - len(raw))
+        self.assertEqual(len(raw), MAX_REQUEST_BYTES)
+        self.assertEqual(_parse_request(raw)["files"], ["example.txt"])
+        with self.assertRaisesRegex(Exception, "UTF-8"):
+            _parse_request(b'{"task":"\xff"}')
+
+    def test_combined_patch_prompt_budget_rejects_before_model(self):
+        from qwen_worker_server import _build_prompt
+
+        with self.assertRaisesRegex(ValueError, "MODEL_INPUT_TOO_LARGE"):
+            _build_prompt(
+                "t" * MAX_TASK_CHARS,
+                Path("/tmp"),
+                [("text.txt", "s" * MAX_SOURCE_CHARS)],
+                "o" * MAX_TEST_OUTPUT_CHARS,
+            )
+        self.assertEqual(
+            MAX_TASK_CHARS + MAX_SOURCE_CHARS + MAX_TEST_OUTPUT_CHARS,
+            MAX_MODEL_INPUT_CHARS,
+        )
 
 
 if __name__ == "__main__":

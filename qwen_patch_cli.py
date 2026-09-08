@@ -7,9 +7,23 @@ import asyncio
 import json
 import logging
 import sys
-from pathlib import Path
 from typing import Any
 
+from qwen_input_limits import (
+    MAX_PATH_BYTES,
+    MAX_PATH_CHARS,
+    MAX_REQUEST_BYTES,
+    MAX_SOURCE_FILES,
+    MAX_TASK_BYTES,
+    MAX_TASK_CHARS,
+    MAX_TEST_OUTPUT_BYTES,
+    MAX_TEST_OUTPUT_CHARS,
+    InputLimitError,
+    read_bounded,
+    read_bounded_file,
+    validate_string_list,
+    validate_text,
+)
 from qwen_worker_server import run_qwen_worker
 
 
@@ -20,13 +34,26 @@ class RequestError(ValueError):
 def _request_bytes(arguments: list[str]) -> bytes:
     if not arguments:
         try:
-            return sys.stdin.buffer.read()
+            return read_bounded(sys.stdin.buffer, MAX_REQUEST_BYTES, field="stdin")
+        except InputLimitError as exc:
+            raise RequestError(str(exc)) from exc
         except OSError as exc:
             raise RequestError(f"could not read stdin: {exc}") from exc
 
     if len(arguments) == 2 and arguments[0] == "--request-file":
         try:
-            return Path(arguments[1]).read_bytes()
+            validate_text(
+                arguments[1],
+                field="request file path",
+                max_bytes=MAX_PATH_BYTES,
+                max_chars=MAX_PATH_CHARS,
+                code="PATH_TOO_LONG",
+            )
+            return read_bounded_file(
+                arguments[1], MAX_REQUEST_BYTES, field="request file"
+            )
+        except InputLimitError as exc:
+            raise RequestError(str(exc)) from exc
         except OSError as exc:
             raise RequestError(f"could not read request file: {exc}") from exc
 
@@ -34,6 +61,11 @@ def _request_bytes(arguments: list[str]) -> bytes:
 
 
 def _parse_request(raw: bytes) -> dict[str, Any]:
+    if len(raw) > MAX_REQUEST_BYTES:
+        raise RequestError(
+            f"REQUEST_TOO_LARGE field=request observed_bytes={len(raw)} "
+            f"limit={MAX_REQUEST_BYTES}"
+        )
     try:
         document = raw.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -60,13 +92,44 @@ def _parse_request(raw: bytes) -> dict[str, Any]:
 
     if not isinstance(request["task"], str):
         raise RequestError("task must be a string")
-    if not isinstance(request["repo_root"], str):
-        raise RequestError("repo_root must be a string")
-    files = request["files"]
-    if not isinstance(files, list) or any(not isinstance(item, str) for item in files):
-        raise RequestError("files must be an array of strings")
-    if "test_output" in request and not isinstance(request["test_output"], str):
-        raise RequestError("test_output must be a string")
+    try:
+        request["task"] = validate_text(
+            request["task"],
+            field="task",
+            max_bytes=MAX_TASK_BYTES,
+            max_chars=MAX_TASK_CHARS,
+            code="TASK_TOO_LARGE",
+        )
+        if not request["task"].strip():
+            raise RequestError("task must not be empty")
+        request["repo_root"] = validate_text(
+            request["repo_root"],
+            field="repo_root",
+            max_bytes=MAX_PATH_BYTES,
+            max_chars=MAX_PATH_CHARS,
+            code="PATH_TOO_LONG",
+        )
+        request["files"] = validate_string_list(
+            request["files"],
+            field="files",
+            max_items=MAX_SOURCE_FILES,
+            count_code="TOO_MANY_FILES",
+            item_kind="path",
+            max_bytes=MAX_PATH_BYTES,
+            max_chars=MAX_PATH_CHARS,
+        )
+        if "test_output" in request:
+            request["test_output"] = validate_text(
+                request["test_output"],
+                field="test_output",
+                max_bytes=MAX_TEST_OUTPUT_BYTES,
+                max_chars=MAX_TEST_OUTPUT_CHARS,
+                code="TEST_OUTPUT_TOO_LARGE",
+            )
+    except InputLimitError as exc:
+        raise RequestError(str(exc)) from exc
+    except ValueError as exc:
+        raise RequestError(str(exc)) from exc
 
     return request
 
