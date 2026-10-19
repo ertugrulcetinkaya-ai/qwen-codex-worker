@@ -9,6 +9,7 @@ import json
 import os
 import re
 import sys
+import tempfile
 import time
 from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
 from dataclasses import dataclass
@@ -40,12 +41,10 @@ from qwen_input_limits import (
     validate_string_list,
     validate_text,
 )
+from qwen_omlx_auth import api_headers as _omlx_api_headers
 
 DEFAULT_BASE_URL: str | None = None
-DEFAULT_MODEL = (
-    "/Users/ertugrulcetinkaya/Models/Qwen3.8-Flash-Next-GGUF/UD-IQ4_XS/"
-    "Qwen3.8-Flash-Next-UD-IQ4_XS-00001-of-00003.gguf"
-)
+DEFAULT_MODEL = "Qwen3.8-Flash-Next-oQ4e-mtp"
 MAX_FILES = MAX_SOURCE_FILES
 MAX_SOURCE_CHARS = 260_000
 MAX_SOURCE_BYTES = 1_100_000
@@ -248,8 +247,10 @@ path/to/file2"""
 mcp = FastMCP(
     "qwen_worker",
     instructions=(
-        "Read-only implementation worker. qwen_patch reads only caller-selected repository "
-        "files and returns model-generated text. It never changes or executes repository content."
+        "qwen_patch is a read-only implementation worker that returns validated model-generated "
+        "unified diff text. qwen_agent edits only explicit writable scopes inside a disposable "
+        "temporary sandbox and can run only caller-allowlisted commands through the host's "
+        "network-denying command sandbox. Required host validation runs after the model says done."
     ),
 )
 
@@ -596,7 +597,7 @@ def _validate_diff_targets(
     if new_path == "/dev/null":
         raise RuntimeError("GENERATION_INVALID_OUTPUT: PATCH_DELETE_NOT_ALLOWED")
     if old_path != new_path:
-        raise RuntimeError("GENERATION_INVALID_OUTPUT: PATCH_RENAME_NOT_ALLOWED")
+        raise RuntimeError("GENERATION_INVALID_OUTPUT: PATCH_TARGET_PATH_MISMATCH")
     if old_path not in allowed_files:
         raise RuntimeError("GENERATION_INVALID_OUTPUT: PATCH_TARGET_NOT_ALLOWED")
     if old_path in seen_targets:
@@ -611,15 +612,24 @@ def _validate_worker_output(
     lines = output.splitlines()
     if not lines:
         raise RuntimeError("GENERATION_INVALID_OUTPUT: empty output")
+    allowed = frozenset(allowed_files)
     if lines[0] == "NEED_FILES:":
         if len(lines) < 2 or any(not line.strip() for line in lines[1:]):
             raise RuntimeError("GENERATION_INVALID_OUTPUT: malformed NEED_FILES response")
         for name in lines[1:]:
-            path = Path(name.strip())
-            if path.is_absolute() or ".." in path.parts:
+            try:
+                requested = _normalize_diff_target(name.strip(), side="old")
+            except RuntimeError as exc:
+                raise RuntimeError(
+                    "GENERATION_INVALID_OUTPUT: unsafe NEED_FILES path"
+                ) from exc
+            if requested == "/dev/null":
                 raise RuntimeError("GENERATION_INVALID_OUTPUT: unsafe NEED_FILES path")
+            if requested in allowed:
+                raise RuntimeError(
+                    "GENERATION_INVALID_OUTPUT: NEED_FILES_ALREADY_SUPPLIED"
+                )
         return
-    allowed = frozenset(allowed_files)
     hunk_header = re.compile(
         r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(?: .*)?$"
     )
@@ -678,7 +688,11 @@ def _validate_worker_output(
                     raise RuntimeError("GENERATION_INVALID_OUTPUT: malformed hunk line")
                 index += 1
             if old_seen != old_expected or new_seen != new_expected:
-                raise RuntimeError("GENERATION_INVALID_OUTPUT: truncated hunk")
+                raise RuntimeError(
+                    "GENERATION_INVALID_OUTPUT: truncated hunk "
+                    f"old_expected={old_expected} old_seen={old_seen} "
+                    f"new_expected={new_expected} new_seen={new_seen}"
+                )
             hunk_count += 1
         if hunk_count == 0:
             raise RuntimeError("GENERATION_INVALID_OUTPUT: diff contains no hunks")
@@ -1234,6 +1248,7 @@ async def run_qwen_worker(
         timeout=HTTP_TIMEOUT,
         trust_env=False,
         follow_redirects=False,
+        headers=_omlx_api_headers(),
     ) as client:
         await _preflight(client, base_url, model)
         final_text, _attempts = await _generate_stream(client, base_url, model, prompt)
@@ -1322,6 +1337,100 @@ async def qwen_patch(
     returns Qwen's response text unchanged.
     """
     return await run_qwen_worker(task, repo_root, files, test_output)
+
+
+def _validate_agent_sandbox(sandbox: str) -> str:
+    """Require the write-capable MCP agent to target a child of a temp root."""
+    if not isinstance(sandbox, str):
+        raise ValueError("agent sandbox must be an absolute temporary path")
+    try:
+        sandbox = validate_text(
+            sandbox,
+            field="sandbox",
+            max_bytes=MAX_PATH_BYTES,
+            max_chars=MAX_PATH_CHARS,
+            code="PATH_TOO_LONG",
+        )
+    except InputLimitError as exc:
+        raise ValueError(str(exc)) from exc
+    candidate = Path(sandbox).expanduser()
+    if not candidate.is_absolute():
+        raise ValueError("agent sandbox must be an absolute temporary path")
+    try:
+        root = candidate.resolve(strict=True)
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ValueError("agent sandbox must be an existing directory") from exc
+    if not root.is_dir():
+        raise ValueError("agent sandbox must be an existing directory")
+
+    temporary_roots: list[Path] = []
+    for value in (Path(tempfile.gettempdir()), Path("/tmp")):
+        try:
+            resolved = value.resolve(strict=True)
+        except (OSError, RuntimeError):
+            continue
+        if resolved.is_dir() and resolved not in temporary_roots:
+            temporary_roots.append(resolved)
+    if not any(
+        root != parent and root.is_relative_to(parent)
+        for parent in temporary_roots
+    ):
+        raise ValueError("agent sandbox must be a child of a local temporary directory")
+    return str(root)
+
+
+@mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=False,
+        destructiveHint=True,
+        idempotentHint=False,
+        openWorldHint=False,
+    )
+)
+async def qwen_agent(
+    task: str,
+    sandbox: str,
+    allow: list[str],
+    read_only: list[str] | None = None,
+    allowed_commands: list[str] | None = None,
+    validation_commands: list[str] | None = None,
+    validation_read_paths: list[str] | None = None,
+    validation_output_paths: list[str] | None = None,
+    validation_failure: str | None = None,
+    max_actions: int = 30,
+    profile: str = "non-thinking",
+    resume: bool = False,
+) -> dict[str, Any]:
+    """Edit explicit files in a disposable temporary sandbox and run host validation.
+
+    The model edits files through validated JSON actions. It does not generate a diff.
+    Writable and read-only scopes are relative to the sandbox. Required validation commands
+    must also appear exactly in allowed_commands. When validation_read_paths is supplied,
+    validation commands can read only those paths; otherwise they use the model's declared
+    readable scopes. They write only to explicitly declared validation_output_paths.
+    Neither path list expands the model's file scopes.
+    Set resume=True to revalidate existing partial work first and continue only if it fails.
+    """
+    from qwen_agent_profiles import normalize_profile, run_qwen_agent_profile
+
+    # Normalize/reject invalid profiles before any sandbox or network work.
+    selected_profile = normalize_profile(profile)
+
+    result = await run_qwen_agent_profile(
+        profile=selected_profile,
+        task=task,
+        sandbox=_validate_agent_sandbox(sandbox),
+        allow=allow,
+        read_only=read_only,
+        allowed_commands=allowed_commands,
+        validation_commands=validation_commands,
+        validation_read_paths=validation_read_paths,
+        validation_output_paths=validation_output_paths,
+        validation_failure=validation_failure,
+        max_actions=max_actions,
+        resume=resume,
+    )
+    return result
 
 
 if __name__ == "__main__":

@@ -48,9 +48,11 @@ jobs:
       - name: Compile source and tests
         run: >-
           uv run python -m compileall -q
-          qwen_agent.py qwen_agent_cli.py qwen_input_limits.py qwen_patch_cli.py
-          qwen_worker_server.py test_qwen_agent.py test_qwen_patch_cli.py
-          test_qwen_worker_server.py
+          qwen_agent.py qwen_agent_cli.py qwen_agent_profiles.py qwen_input_limits.py
+          qwen_omlx_auth.py qwen_patch_cli.py qwen_worker_server.py
+          test_qwen_agent.py test_qwen_agent_profile_cli.py
+          test_qwen_agent_profile_mcp_small.py test_qwen_agent_profiles.py
+          test_qwen_omlx_auth.py test_qwen_patch_cli.py test_qwen_worker_server.py
 
       - name: Audit locked dependencies
         run: uv run pip-audit

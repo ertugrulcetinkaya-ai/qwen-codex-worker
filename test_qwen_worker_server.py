@@ -31,6 +31,7 @@ from qwen_worker_server import (
     _parse_chat_completion_stream,
     _preflight,
     _validate_worker_output,
+    qwen_agent,
     qwen_patch,
     run_qwen_worker,
 )
@@ -108,6 +109,71 @@ class EndpointConfigurationTests(unittest.TestCase):
         self.assertNotIn(str(root), prompt)
         self.assertIn("src/main.py", prompt)
         self.assertIn("Only modify files explicitly supplied", prompt)
+
+
+class AgentMcpToolTests(unittest.IsolatedAsyncioTestCase):
+    async def test_direct_edit_tool_forwards_scopes_and_host_validation(self):
+        class FakeAgentResult:
+            @staticmethod
+            def as_dict():
+                return {
+                    "status": "validated",
+                    "validated": True,
+                    "files_changed": ["src/example.py"],
+                    "model_calls": 3,
+                    "prompt_tokens": 100,
+                    "completion_tokens": 12,
+                    "total_tokens": 112,
+                }
+
+        with tempfile.TemporaryDirectory(prefix="qwen-mcp-agent-") as parent:
+            sandbox = Path(parent, "task-001")
+            sandbox.mkdir()
+            profile_state = Path(parent, "private-state", "profiles.sqlite3")
+            runner = mock.AsyncMock(return_value=FakeAgentResult())
+            with mock.patch(
+                "qwen_agent_profiles._PROFILE_BINDINGS_DB_PATH", profile_state
+            ), mock.patch("qwen_agent.run_qwen_agent", new=runner):
+                result = await qwen_agent(
+                    task="Fix one small bug.",
+                    sandbox=str(sandbox),
+                    allow=["src/example.py"],
+                    read_only=["tests"],
+                    allowed_commands=["python -m unittest -q"],
+                    validation_commands=["python -m unittest -q"],
+                    validation_read_paths=["test", "src"],
+                    validation_output_paths=[".dart_tool", "build"],
+                    resume=True,
+                )
+
+        self.assertTrue(result["validated"])
+        self.assertEqual(result["prompt_tokens"], 100)
+        runner.assert_awaited_once()
+        request = runner.await_args.kwargs
+        self.assertEqual(request["allow"], ["src/example.py"])
+        self.assertEqual(request["read_only"], ["tests"])
+        self.assertEqual(
+            request["allowed_commands"], ["python -m unittest -q"]
+        )
+        self.assertEqual(
+            request["validation_commands"], ["python -m unittest -q"]
+        )
+        self.assertEqual(request["validation_read_paths"], ["test", "src"])
+        self.assertEqual(
+            request["validation_output_paths"], [".dart_tool", "build"]
+        )
+        self.assertTrue(request["resume"])
+
+    async def test_direct_edit_tool_rejects_repository_root(self):
+        runner = mock.AsyncMock()
+        with mock.patch("qwen_agent.run_qwen_agent", new=runner):
+            with self.assertRaisesRegex(ValueError, "temporary directory"):
+                await qwen_agent(
+                    task="Do not run this.",
+                    sandbox=str(Path(__file__).parent.resolve()),
+                    allow=["test_qwen_worker_server.py"],
+                )
+        runner.assert_not_awaited()
 
 
 class ChatCompletionParserTests(unittest.TestCase):
@@ -1044,6 +1110,9 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
             Path(directory, "file.txt").write_text("alpha\n", encoding="utf-8")
             with mock.patch.dict(
                 "os.environ", {"QWEN_BASE_URL": "http://127.0.0.1:11234/v1"}
+            ), mock.patch(
+                "qwen_worker_server._omlx_api_headers",
+                return_value={"Authorization": "Bearer unit-test-key"},
             ), mock.patch("qwen_worker_server.httpx.AsyncClient", TestClient):
                 direct = await run_qwen_worker("task", directory, ["file.txt"])
                 mcp_result = await qwen_patch("task", directory, ["file.txt"])
@@ -1057,6 +1126,10 @@ class TransportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(
             [options["follow_redirects"] for options in client_options], [False, False]
+        )
+        self.assertEqual(
+            [options["headers"]["Authorization"] for options in client_options],
+            ["Bearer unit-test-key", "Bearer unit-test-key"],
         )
 
 
@@ -1133,6 +1206,12 @@ class WorkerOutputValidationTests(unittest.TestCase):
             ):
                 self.validate(output)
 
+    def test_need_files_cannot_repeat_a_supplied_path(self):
+        with self.assertRaisesRegex(
+            RuntimeError, "NEED_FILES_ALREADY_SUPPLIED"
+        ):
+            self.validate("NEED_FILES:\nsrc/foo.py")
+
     def test_valid_multi_hunk_diff_is_accepted(self):
         self.validate(
             "--- a/src/foo.py\n"
@@ -1203,12 +1282,22 @@ class WorkerOutputValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "PATCH_DELETE_NOT_ALLOWED"):
             self.validate(self.diff("a/src/foo.py", "/dev/null"))
 
-    def test_rename_and_cross_file_targets_are_rejected(self):
-        with self.assertRaisesRegex(RuntimeError, "PATCH_RENAME_NOT_ALLOWED"):
+    def test_cross_file_targets_report_path_mismatch(self):
+        with self.assertRaisesRegex(RuntimeError, "PATCH_TARGET_PATH_MISMATCH"):
             self.validate(
                 self.diff("a/src/foo.py", "b/src/bar.py"),
                 allowed_files=("src/foo.py", "src/bar.py"),
             )
+
+    def test_git_rename_metadata_is_rejected(self):
+        output = (
+            "diff --git a/src/foo.py b/src/bar.py\n"
+            "similarity index 100%\n"
+            "rename from src/foo.py\n"
+            "rename to src/bar.py\n"
+        )
+        with self.assertRaisesRegex(RuntimeError, "PATCH_RENAME_NOT_ALLOWED"):
+            self.validate(output, allowed_files=("src/foo.py", "src/bar.py"))
 
     def test_duplicate_target_sections_are_rejected(self):
         with self.assertRaisesRegex(RuntimeError, "PATCH_DUPLICATE_TARGET"):
@@ -1253,6 +1342,14 @@ class WorkerOutputValidationTests(unittest.TestCase):
                 RuntimeError, "GENERATION_INVALID_OUTPUT"
             ):
                 self.validate(output)
+
+    def test_truncated_hunk_reports_expected_and_observed_lines(self):
+        output = "--- a/src/foo.py\n+++ b/src/foo.py\n@@ -1 +1 @@\n-old\n"
+        with self.assertRaisesRegex(
+            RuntimeError,
+            r"truncated hunk old_expected=1 old_seen=1 new_expected=1 new_seen=0",
+        ):
+            self.validate(output)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import os
@@ -18,7 +19,7 @@ import sys
 import tempfile
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from pathlib import Path
 from typing import Any, BinaryIO, Callable, Iterable, cast
@@ -40,6 +41,8 @@ from qwen_input_limits import (
     MAX_VALIDATION_COMMANDS,
     MAX_VALIDATION_FAILURE_BYTES,
     MAX_VALIDATION_FAILURE_CHARS,
+    MAX_VALIDATION_OUTPUT_PATHS,
+    MAX_VALIDATION_READ_PATHS,
     InputLimitError,
     ensure_model_input,
     ensure_request_budget,
@@ -47,6 +50,7 @@ from qwen_input_limits import (
     validate_string_list,
     validate_text,
 )
+from qwen_omlx_auth import api_headers as _omlx_api_headers
 from qwen_worker_server import (
     DEFAULT_MODEL,
     HTTP_TIMEOUT,
@@ -79,13 +83,16 @@ from qwen_worker_server import (
 
 MAX_AGENT_ACTIONS = 30
 MAX_PROTOCOL_ERRORS = 3
+MAX_IDENTICAL_ACTION_REPEATS = 4
 MAX_READ_BYTES = 64_000
-MAX_READ_CHARS = 32_000
+MAX_READ_CHARS = 40_000
+MAX_RANGE_READ_SCAN_BYTES = 16_000_000
 MAX_GREP_FILES = 500
 MAX_GREP_MATCHES = 100
 MAX_GREP_RESPONSE_CHARS = 20_000
 MAX_GREP_RESPONSE_BYTES = 80_000
-MAX_GREP_FILE_BYTES = 64_000
+MAX_GREP_FILE_BYTES = 4_000_000
+MAX_GREP_TOTAL_BYTES = 16_000_000
 MAX_WRITE_BYTES = 1_000_000
 MAX_ACTION_TEXT_CHARS = MAX_AGENT_FINAL_CONTENT_CHARS
 MAX_ACTION_TEXT_BYTES = MAX_AGENT_FINAL_CONTENT_BYTES
@@ -100,9 +107,18 @@ MAX_AGENT_BASE_CONTEXT_CHARS = 144_000
 MAX_AGENT_STATE_SUMMARY_CHARS = 8_000
 MAX_AGENT_RECENT_CHARS = 44_000
 MAX_AGENT_RECENT_INTERACTIONS = 6
+ACTION_REPEAT_WINDOW = MAX_AGENT_RECENT_INTERACTIONS
+MAX_AGENT_PINNED_READ_FILES = 6
+MAX_AGENT_PINNED_READ_CHARS = 64_000
+MIN_PINNED_READ_CHARS = 2_048
+MAX_DISCOVERY_ACTIONS_WITHOUT_PROGRESS = 22
+DISCOVERY_PROGRESS_WARNING_AT = 12
+DISCOVERY_ACTIONS_BEFORE_REQUIRED_EDIT = 6
+DISCOVERY_ACTIONS_AFTER_FAILED_VALIDATION = 3
 MAX_AGENT_STATE_EVENTS = 100
 MAX_AGENT_VALIDATION_FAILURE_CHARS = 8_000
 MAX_AGENT_CONTEXT_LIST_CHARS = 4_000
+MAX_PINNED_FAILURE_CHARS = 4_000
 MAX_VALIDATION_ROUNDS = 3
 AGENT_SYSTEM_PROMPT = """You are a constrained code implementation worker operating only inside the
 explicit sandbox supplied by the caller.
@@ -125,6 +141,8 @@ credentials, .env files, or paths outside the sandbox. Use replace for small
 edits. Write is primarily for creating a new file; an existing non-empty file
 may be rewritten only after that exact file has had a complete explicit read
 and has not changed since that read. A grep never counts as a complete read.
+If a full read reports that a file exceeds its limit, use a targeted grep or a
+bounded read with start_line and end_line; do not repeat the unbounded read.
 A replace.old string must be copied exactly from previously read file content.
 Successful replace and write actions invalidate prior full-read proof, so read
 the file again before a later full overwrite. After an action-validation error,
@@ -134,70 +152,160 @@ summary. Stop with done when the filesystem state satisfies the task. Done
 only means that you have finished editing; the host may run required validation
 commands afterward, and a model-run command is not proof that the task is
 validated.
+
+Reuse a complete file read already present in the recent conversation when the
+file has not changed. Do not spend another model turn rereading it unless the
+previous read was partial, has fallen out of context, or a successful edit or
+command may have changed the file.
+
+Before the first action, make a short internal plan of 2-5 concrete steps.
+Find the relevant implementation, tests, and direct dependencies with targeted
+grep/read actions; avoid broad directory scans and repeated complete reads.
+Before editing, verify every referenced class, constructor, enum, method, and
+field against its declaration in the current source. Read direct dependencies
+that define those APIs, and check every affected test and caller before making
+multi-file changes. Never invent a symbol from a test name or task description.
+If an initial external validation failure is provided, start from its failing
+assertion or traceback and inspect only the implicated implementation and direct
+dependencies. Do not spend an action rerunning the same known failing check before
+making a relevant edit.
+After the smallest coherent edit, run the most relevant allowlisted test and
+use its exact output to repair failures before done. The host also runs required
+validation commands after each successful file mutation; treat a failed compile
+or test as immediate repair feedback. Return to the implementation file named by
+the diagnostic, verify the referenced API, and make a targeted correction before
+running that same check again. For multi-file edits, keep callers, declarations,
+tests, and dependencies consistent. Reserve actions for a test, any needed
+repair, and done. Do not repeat an identical action when the same result is
+already in the retained conversation; choose new evidence or make progress
+instead. If required host validation fails, inspect that failure and repair the
+in-scope code or successfully rerun the failing required command before emitting
+done again.
+After a required test or compiler failure, use at most three targeted reads or
+greps before making a relevant repair or successfully rerunning the failed
+command. Repeated inspection without a source change is not progress.
 """
 
-AGENT_RESPONSE_FORMAT = {
-    "type": "json_object",
-    "schema": {
-        "oneOf": [
-            {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["read"]},
-                    "path": {"type": "string"},
-                    "start_line": {"type": "integer"},
-                    "end_line": {"type": "integer"},
-                },
-                "required": ["action", "path"],
-                "additionalProperties": False,
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["grep"]},
-                    "query": {"type": "string"},
-                    "paths": {
-                        "type": "array",
-                        "items": {"type": "string"},
+AGENT_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "qwen_worker_action",
+        "strict": False,
+        "schema": {
+            "oneOf": [
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["read"]},
+                        "path": {"type": "string"},
+                        "start_line": {"type": "integer"},
+                        "end_line": {"type": "integer"},
                     },
+                    "required": ["action", "path"],
+                    "additionalProperties": False,
                 },
-                "required": ["action", "query"],
-                "additionalProperties": False,
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["replace"]},
-                    "path": {"type": "string"},
-                    "old": {"type": "string"},
-                    "new": {"type": "string"},
-                    "count": {"type": "integer"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["grep"]},
+                        "query": {"type": "string"},
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                        },
+                    },
+                    "required": ["action", "query"],
+                    "additionalProperties": False,
                 },
-                "required": ["action", "path", "old", "new"],
-                "additionalProperties": False,
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["write"]},
-                    "path": {"type": "string"},
-                    "content": {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["replace"]},
+                        "path": {"type": "string"},
+                        "old": {"type": "string"},
+                        "new": {"type": "string"},
+                        "count": {"type": "integer"},
+                    },
+                    "required": ["action", "path", "old", "new"],
+                    "additionalProperties": False,
                 },
-                "required": ["action", "path", "content"],
-                "additionalProperties": False,
-            },
-            {
-                "type": "object",
-                "properties": {
-                    "action": {"type": "string", "enum": ["done"]},
-                    "summary": {"type": "string"},
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["write"]},
+                        "path": {"type": "string"},
+                        "content": {"type": "string"},
+                    },
+                    "required": ["action", "path", "content"],
+                    "additionalProperties": False,
                 },
-                "required": ["action", "summary"],
-                "additionalProperties": False,
-            },
-        ],
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["run"]},
+                        "command": {"type": "string"},
+                    },
+                    "required": ["action", "command"],
+                    "additionalProperties": False,
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "action": {"type": "string", "enum": ["done"]},
+                        "summary": {"type": "string"},
+                    },
+                    "required": ["action", "summary"],
+                    "additionalProperties": False,
+                },
+            ],
+        },
     },
 }
+EDIT_RESPONSE_FORMAT: dict[str, Any] = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "qwen_worker_edit",
+        "strict": False,
+        "schema": {
+            "oneOf": [
+                alternative
+                for alternative in AGENT_RESPONSE_FORMAT["json_schema"]["schema"]["oneOf"]
+                if alternative["properties"]["action"]["enum"]
+                in (["replace"], ["write"])
+            ]
+        },
+    },
+}
+
+
+def _edit_response_format_for_paths(
+    editable_file_paths: Iterable[str] | None,
+    *,
+    repair_read_path: str | None = None,
+) -> dict[str, Any]:
+    """Constrain repair actions to writable files and an optional refresh read."""
+    if repair_read_path is None:
+        response_format = copy.deepcopy(EDIT_RESPONSE_FORMAT)
+    else:
+        response_format = copy.deepcopy(AGENT_RESPONSE_FORMAT)
+        response_format["json_schema"]["name"] = "qwen_worker_repair_read"
+        response_format["json_schema"]["schema"]["oneOf"] = [
+            alternative
+            for alternative in response_format["json_schema"]["schema"]["oneOf"]
+            if alternative["properties"]["action"]["enum"][0] == "read"
+        ]
+    paths = (
+        sorted(set(editable_file_paths))
+        if editable_file_paths is not None
+        else []
+    )
+    for alternative in response_format["json_schema"]["schema"]["oneOf"]:
+        action = alternative["properties"]["action"]["enum"][0]
+        if action == "read":
+            alternative["properties"]["path"]["enum"] = [repair_read_path]
+        elif paths:
+            alternative["properties"]["path"]["enum"] = paths
+    return response_format
 
 FORBIDDEN_BASENAMES = frozenset(
     {
@@ -257,6 +365,12 @@ class AgentGeneration:
     event_count: int = 0
     final_content_bytes: int = 0
     reasoning_content_bytes: int = 0
+    prompt_tokens: int | None = None
+    total_tokens: int | None = None
+    response_format_warning: bool = False
+    generation_request_attempts: int = 1
+    generation_token_cap: int = MAX_OUTPUT_TOKENS
+    prefill_memory_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -264,6 +378,9 @@ class AgentInteraction:
     assistant_content: str
     result_content: str
     metadata: str
+    read_path: str | None = None
+    read_sha256: str | None = None
+    complete_read: bool = False
 
     @property
     def chars(self) -> int:
@@ -305,6 +422,33 @@ def _context_scalar(value: Any, limit: int = 240) -> str:
     if value is None:
         return "<none>"
     return _truncate_context(" ".join(str(value).split()), limit)
+
+
+def _pinned_validation_failure(result: dict[str, Any]) -> str:
+    """Keep concise compiler/test diagnostics after recent turns are compacted."""
+    summary: dict[str, Any] = {
+        key: result[key]
+        for key in ("command", "returncode", "action")
+        if key in result
+    }
+    diagnostic = re.compile(
+        r"\b(error|failed|failure|assertion|exception|traceback|not defined|"
+        r"not found|undefined|missing|compilation|expected:)\b",
+        re.IGNORECASE,
+    )
+    for field in ("stderr", "stdout", "error"):
+        value = result.get(field)
+        if not isinstance(value, str) or not value:
+            continue
+        matching_lines = [line for line in value.splitlines() if diagnostic.search(line)]
+        if matching_lines:
+            summary[field] = "\n".join(matching_lines[-16:])
+    if not any(field in summary for field in ("stderr", "stdout", "error")):
+        summary["diagnostic"] = (
+            "No concise compiler/test diagnostic was found in the retained output. "
+            "Use the latest validation result in the recent conversation."
+        )
+    return _truncate_context(_protocol_result(summary), MAX_PINNED_FAILURE_CHARS)
 
 
 def _build_agent_base_prompt(
@@ -426,9 +570,11 @@ def _interaction_metadata(
             f"truncation_reason={_context_scalar(truncation_reason)}"
         )
     if action_name == "run":
+        changed_paths = result.get("changed_paths")
         return (
             f"run command={_context_scalar(action.get('command'))} "
             f"returncode={result.get('returncode')} "
+            f"changed_paths={_context_scalar(changed_paths)} "
             f"stdout_chars={len(result.get('stdout', '')) if isinstance(result.get('stdout'), str) else 0} "
             f"stderr_chars={len(result.get('stderr', '')) if isinstance(result.get('stderr'), str) else 0}"
         )
@@ -513,6 +659,7 @@ class AgentConversation:
         allowed_commands: Iterable[str],
         validation_failure: str | None,
         validation_commands: Iterable[str] = (),
+        max_actions: int = MAX_AGENT_ACTIONS,
     ) -> None:
         self.base_prompt = _build_agent_base_prompt(
             task,
@@ -529,8 +676,72 @@ class AgentConversation:
         self._actions_completed = 0
         self._protocol_errors = 0
         self._last_command = "(none)"
+        self._last_edit_summary: str | None = None
+        self._last_validation_failure: str | None = None
         self._dropped_interactions = 0
         self._history_compacted = False
+        self._deduplicated_reads = 0
+        self._deduplicated_read_chars = 0
+        self._pinned_reads: dict[str, tuple[str, str]] = {}
+        self._pinned_read_references = 0
+        self._max_actions = max_actions
+
+    @staticmethod
+    def _full_read_identity(
+        action: dict[str, Any] | None, result: dict[str, Any]
+    ) -> tuple[str, str] | None:
+        if (
+            action is None
+            or action.get("action") != "read"
+            or action.get("start_line", 1) != 1
+            or action.get("end_line") is not None
+            or result.get("ok") is not True
+            or result.get("action") != "read"
+            or result.get("context_truncated") is True
+        ):
+            return None
+        path = result.get("path")
+        content = result.get("content")
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(content, str)
+            or len(content) > MAX_READ_CHARS
+        ):
+            return None
+        return path, hashlib.sha256(content.encode("utf-8")).hexdigest()
+
+    def _has_retained_full_read(self, path: str, sha256: str) -> bool:
+        for interaction in self._recent:
+            if (
+                not interaction.complete_read
+                or interaction.read_path != path
+                or interaction.read_sha256 != sha256
+            ):
+                continue
+            try:
+                result = json.loads(interaction.result_content)
+            except json.JSONDecodeError:
+                continue
+            content = result.get("content") if isinstance(result, dict) else None
+            if (
+                isinstance(content, str)
+                and result.get("context_truncated") is not True
+                and hashlib.sha256(content.encode("utf-8")).hexdigest() == sha256
+            ):
+                return True
+        return False
+
+    def _can_append_without_trimming(
+        self, assistant_content: str, result_content: str
+    ) -> bool:
+        return (
+            len(self._recent) < MAX_AGENT_RECENT_INTERACTIONS
+            and sum(item.chars for item in self._recent)
+            + len(assistant_content)
+            + len(result_content)
+            <= MAX_AGENT_RECENT_CHARS
+        )
 
     def record(
         self,
@@ -545,11 +756,125 @@ class AgentConversation:
     ) -> None:
         result_content = _protocol_result(result)
         metadata = _interaction_metadata(action, result)
+        read_identity = self._full_read_identity(action, result)
+        complete_read = read_identity is not None
+        read_path, read_sha256 = read_identity or (None, None)
+        action_name = action.get("action") if isinstance(action, dict) else None
+        if action_name in {"replace", "write"} and result.get("ok") is True:
+            self._last_edit_summary = metadata
+        elif (
+            action_name == "run"
+            and result.get("ok") is True
+            and result.get("changed_paths")
+        ):
+            self._last_edit_summary = metadata
+        post_edit_validation = result.get("post_edit_validation")
+        if isinstance(post_edit_validation, dict):
+            if post_edit_validation.get("ok") is True:
+                self._last_validation_failure = None
+            else:
+                self._last_validation_failure = _pinned_validation_failure(
+                    post_edit_validation
+                )
+        elif action_name in {"run", "validation"}:
+            if result.get("ok") is True:
+                if action_name == "validation":
+                    self._last_validation_failure = None
+            else:
+                self._last_validation_failure = _pinned_validation_failure(result)
+        if result.get("ok") is True and action_name in {"replace", "write"}:
+            changed_path = result.get("path") or (
+                action.get("path") if isinstance(action, dict) else None
+            )
+            if isinstance(changed_path, str):
+                self._pinned_reads.pop(changed_path, None)
+            else:
+                self._pinned_reads.clear()
+        elif result.get("ok") is True and action_name == "run":
+            changed_paths = result.get("changed_paths")
+            if isinstance(changed_paths, list):
+                for changed_path in changed_paths:
+                    if isinstance(changed_path, str):
+                        self._pinned_reads.pop(changed_path, None)
+            else:
+                # Without a reported write set, cached source evidence may be stale.
+                self._pinned_reads.clear()
+
+        pinned_read_was_available = bool(
+            read_identity is not None
+            and self._pinned_reads.get(read_identity[0], (None, None))[0]
+            == read_identity[1]
+        )
+        if read_identity is not None:
+            pinned_path, pinned_sha256 = read_identity
+            content = result.get("content")
+            self._pinned_reads.pop(pinned_path, None)
+            if (
+                isinstance(content, str)
+                and MIN_PINNED_READ_CHARS <= len(content)
+                and len(content) <= MAX_AGENT_PINNED_READ_CHARS
+            ):
+                self._pinned_reads[pinned_path] = (pinned_sha256, content)
+                while (
+                    len(self._pinned_reads) > MAX_AGENT_PINNED_READ_FILES
+                    or sum(
+                        len(item[1]) for item in self._pinned_reads.values()
+                    )
+                    > MAX_AGENT_PINNED_READ_CHARS
+                ):
+                    oldest_path = next(iter(self._pinned_reads))
+                    self._pinned_reads.pop(oldest_path)
+
+        pinned_read_matches = bool(
+            read_identity is not None
+            and self._pinned_reads.get(read_identity[0], (None, None))[0]
+            == read_identity[1]
+        )
+        retained_full_read = bool(
+            read_identity is not None
+            and self._has_retained_full_read(*read_identity)
+        )
+        retained_read_fits = bool(
+            retained_full_read
+            and self._can_append_without_trimming(
+                assistant_content, result_content
+            )
+        )
+        if (
+            read_identity is not None
+            and (pinned_read_matches or retained_read_fits)
+        ):
+            reference = {
+                "ok": True,
+                "action": "read",
+                "path": read_path,
+                "content_reused": True,
+                "sha256": read_sha256,
+                "content": "The complete file content is retained in the pinned read context above."
+                if pinned_read_matches
+                else (
+                    "Unchanged from the complete read for this path already "
+                    "present earlier in the retained conversation; refer to "
+                    "that content instead of expecting a second copy here."
+                ),
+            }
+            reference_content = _protocol_result(reference)
+            if pinned_read_was_available or retained_full_read:
+                self._deduplicated_reads += 1
+                self._deduplicated_read_chars += max(
+                    0, len(result_content) - len(reference_content)
+                )
+            else:
+                self._pinned_read_references += 1
+            result_content = reference_content
         self._recent.append(
             AgentInteraction(
                 assistant_content,
                 result_content,
                 metadata,
+                read_path,
+                read_sha256,
+                complete_read,
             )
         )
         self._state_events.append(metadata)
@@ -573,7 +898,14 @@ class AgentConversation:
         assistant = _compact_assistant_action(interaction.assistant_content)
         available = max(1, MAX_AGENT_RECENT_CHARS - len(assistant))
         result = _compact_result_json(interaction.result_content, available)
-        return AgentInteraction(assistant, result, interaction.metadata)
+        return AgentInteraction(
+            assistant,
+            result,
+            interaction.metadata,
+            interaction.read_path,
+            interaction.read_sha256,
+            interaction.complete_read,
+        )
 
     def _trim_recent(self) -> None:
         while len(self._recent) > MAX_AGENT_RECENT_INTERACTIONS:
@@ -597,6 +929,8 @@ class AgentConversation:
                 [
                     "COMPACT STATE (metadata only; authorization remains host-side):",
                     f"actions_completed={self._actions_completed}",
+                    f"action_limit={self._max_actions}",
+                    f"actions_remaining={max(0, self._max_actions - self._actions_completed)}",
                     f"protocol_errors={self._protocol_errors}",
                     f"last_command={self._last_command}",
                     "last_interaction:",
@@ -613,6 +947,10 @@ class AgentConversation:
                     _bounded_context_list(
                         self._state_events, MAX_AGENT_STATE_SUMMARY_CHARS
                     ),
+                    "last_validation_failure:",
+                    self._last_validation_failure or "(none)",
+                    "last_edit_summary:",
+                    self._last_edit_summary or "(none)",
                 ]
             ),
             MAX_AGENT_STATE_SUMMARY_CHARS,
@@ -622,8 +960,34 @@ class AgentConversation:
         messages = [
             {"role": "system", "content": AGENT_SYSTEM_PROMPT},
             {"role": "user", "content": self.base_prompt},
-            {"role": "user", "content": self._state_prompt()},
         ]
+        state_content = self._state_prompt()
+        recent_chars = sum(item.chars for item in self._recent)
+        pinned_read_chars = 0
+        current_chars = sum(len(message["content"]) for message in messages)
+        pinned_messages: list[dict[str, str]] = []
+        for path, (sha256, content) in reversed(
+            tuple(self._pinned_reads.items())
+        ):
+            pinned_message = (
+                "PINNED COMPLETE READ (unchanged since it was read; use this "
+                f"content instead of rereading): path={path} sha256={sha256}\n"
+                f"{content}"
+            )
+            if (
+                current_chars
+                + len(state_content)
+                + recent_chars
+                + pinned_read_chars
+                + len(pinned_message)
+                <= MAX_AGENT_HISTORY_CHARS
+            ):
+                pinned_messages.append(
+                    {"role": "user", "content": pinned_message}
+                )
+                pinned_read_chars += len(content)
+        messages.extend(reversed(pinned_messages))
+        messages.append({"role": "user", "content": state_content})
         for interaction in self._recent:
             messages.extend(
                 [
@@ -643,7 +1007,117 @@ class AgentConversation:
             "history_chars": history_chars,
             "history_compacted": self._history_compacted,
             "history_dropped_interactions": self._dropped_interactions,
+            "deduplicated_reads": self._deduplicated_reads,
+            "deduplicated_read_chars": self._deduplicated_read_chars,
+            "pinned_read_references": self._pinned_read_references,
+            "pinned_read_chars": pinned_read_chars,
         }
+
+
+class ActionProgressGuard:
+    """Detect repeated identical actions that return the same result."""
+
+    def __init__(self) -> None:
+        self._recent_fingerprints: list[str] = []
+        self._failed_edit_fingerprints: set[str] = set()
+        self.repeated_actions = 0
+        self.discovery_actions = 0
+        self.failure_pending = False
+
+    @staticmethod
+    def _edit_fingerprint(action: dict[str, Any]) -> str:
+        return hashlib.sha256(
+            json.dumps(
+                action,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+
+    def is_previously_failed_edit(self, action: dict[str, Any]) -> bool:
+        return (
+            action.get("action") in {"replace", "write"}
+            and self._edit_fingerprint(action) in self._failed_edit_fingerprints
+        )
+
+    def allow_new_evidence(self) -> None:
+        """Start a fresh repeat window after an action needs source refresh."""
+        self._recent_fingerprints.clear()
+
+    def observe(
+        self,
+        action: dict[str, Any],
+        result: dict[str, Any],
+        *,
+        mutation_occurred: bool,
+    ) -> int:
+        if mutation_occurred:
+            self._recent_fingerprints.clear()
+            self.discovery_actions = 0
+            post_edit = result.get("post_edit_validation")
+            failed_post_edit = (
+                isinstance(post_edit, dict) and post_edit.get("ok") is False
+            )
+            if failed_post_edit and action.get("action") in {"replace", "write"}:
+                self._failed_edit_fingerprints.add(self._edit_fingerprint(action))
+            self.failure_pending = failed_post_edit
+            return 0
+
+        action_name = action.get("action")
+        if action_name in {"read", "grep"}:
+            self.discovery_actions += 1
+        elif action_name == "run":
+            if result.get("ok") is True:
+                self.discovery_actions = 0
+                self.failure_pending = False
+                self._failed_edit_fingerprints.clear()
+            else:
+                # A failed test is useful feedback, but repeating exploration
+                # after it must still consume the bounded no-progress budget.
+                self.discovery_actions += 1
+                self.failure_pending = True
+        if self.discovery_actions > MAX_DISCOVERY_ACTIONS_WITHOUT_PROGRESS:
+            raise RuntimeError(
+                "AGENT_DISCOVERY_LIMIT: read/grep and failed run actions "
+                f"exceeded {MAX_DISCOVERY_ACTIONS_WITHOUT_PROGRESS} "
+                "without a code mutation or successful allowlisted command"
+            )
+
+        fingerprint_action = (
+            {"action": "done"} if action_name == "done" else action
+        )
+        fingerprint_result = result
+        if action_name == "run":
+            # Test runners often include changing durations or progress text.
+            # Repeating the same failing command without a code mutation is
+            # still the same failed attempt even when that noise differs.
+            fingerprint_result = {
+                "ok": result.get("ok"),
+                "returncode": result.get("returncode"),
+            }
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"action": fingerprint_action, "result": fingerprint_result},
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        self._recent_fingerprints.append(fingerprint)
+        if len(self._recent_fingerprints) > ACTION_REPEAT_WINDOW:
+            self._recent_fingerprints.pop(0)
+        repeat_count = self._recent_fingerprints.count(fingerprint)
+        if repeat_count > 1:
+            self.repeated_actions += 1
+        if repeat_count >= MAX_IDENTICAL_ACTION_REPEATS:
+            action_name = action.get("action", "unknown")
+            raise RuntimeError(
+                "AGENT_REPEATED_ACTION_LIMIT: identical "
+                f"{action_name} action returned the same result "
+                f"{repeat_count} times without a file mutation"
+            )
+        return repeat_count
 
 
 @dataclass(frozen=True)
@@ -675,6 +1149,8 @@ class CommandAccessPolicy:
 class _CommandPathSnapshot:
     kind: str
     digest: str | None = None
+    content: bytes | None = None
+    symlink_target: str | None = None
 
 
 @dataclass(frozen=True)
@@ -683,7 +1159,7 @@ class AgentResult:
     actions: int
     files_changed: list[str]
     model_calls: int
-    completion_tokens: int
+    completion_tokens: int | None
     reasoning_chars: int
     elapsed_ms: int
     read_bytes: int
@@ -692,6 +1168,18 @@ class AgentResult:
     validation_commands: int = 0
     validation_failures: int = 0
     validation_rounds: int = 0
+    prompt_tokens: int | None = None
+    total_tokens: int | None = None
+    model: str | None = None
+    repeated_actions: int = 0
+    discovery_actions: int = 0
+    protocol_errors: int = 0
+    response_format_warnings: int = 0
+    generation_request_attempts: int = 0
+    prefill_memory_retries: int = 0
+    post_edit_validation_runs: int = 0
+    post_edit_validation_failures: int = 0
+    rollback_count: int = 0
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -700,6 +1188,18 @@ class AgentResult:
             "files_changed": self.files_changed,
             "model_calls": self.model_calls,
             "completion_tokens": self.completion_tokens,
+            "prompt_tokens": self.prompt_tokens,
+            "total_tokens": self.total_tokens,
+            "model": self.model,
+            "repeated_actions": self.repeated_actions,
+            "discovery_actions": self.discovery_actions,
+            "protocol_errors": self.protocol_errors,
+            "response_format_warnings": self.response_format_warnings,
+            "generation_request_attempts": self.generation_request_attempts,
+            "prefill_memory_retries": self.prefill_memory_retries,
+            "post_edit_validation_runs": self.post_edit_validation_runs,
+            "post_edit_validation_failures": self.post_edit_validation_failures,
+            "rollback_count": self.rollback_count,
             "reasoning_chars": self.reasoning_chars,
             "elapsed_ms": self.elapsed_ms,
             "read_bytes": self.read_bytes,
@@ -794,6 +1294,8 @@ class SandboxAgent:
         *,
         read_only: Iterable[str] = (),
         allowed_commands: Iterable[str] = (),
+        validation_read_paths: Iterable[str] = (),
+        validation_output_paths: Iterable[str] = (),
     ) -> None:
         root = Path(sandbox).expanduser().resolve(strict=True)
         if not root.is_dir():
@@ -804,6 +1306,48 @@ class SandboxAgent:
         )
         self.readable_scopes = self.writable_scopes + tuple(
             _declared_scope(root, value) for value in read_only
+        )
+        validation_reads: list[tuple[str, bool]] = []
+        for value in validation_read_paths:
+            relative, is_directory = _declared_scope(root, value)
+            if not (root / relative).exists():
+                raise AgentError("validation read paths must already exist")
+            validation_reads.append((relative, is_directory))
+        self.validation_read_scopes = self._initial_command_scope_paths(
+            tuple(validation_reads)
+        )
+        validation_outputs: list[tuple[str, bool]] = []
+        for value in validation_output_paths:
+            relative, is_directory = _declared_scope(root, value)
+            if not is_directory:
+                raise AgentError(
+                    "validation output paths must name existing directories"
+                )
+            validation_outputs.append((relative, is_directory))
+        source_scopes = self.writable_scopes + self.readable_scopes
+        for output_path, _is_directory in validation_outputs:
+            for source_path, source_is_directory in source_scopes:
+                if (
+                    output_path == source_path
+                    or (
+                        source_is_directory
+                        and Path(output_path).parts[: len(Path(source_path).parts)]
+                        == Path(source_path).parts
+                    )
+                    or (
+                        Path(output_path).parts[: len(Path(source_path).parts)]
+                        == Path(source_path).parts
+                    )
+                    or (
+                        Path(source_path).parts[: len(Path(output_path).parts)]
+                        == Path(output_path).parts
+                    )
+                ):
+                    raise AgentError(
+                        "validation output paths must not overlap declared source scopes"
+                    )
+        self.validation_output_scopes = self._initial_command_scope_paths(
+            tuple(validation_outputs)
         )
         if not self.writable_scopes:
             raise AgentError("at least one --allow path is required")
@@ -816,6 +1360,7 @@ class SandboxAgent:
         self.allowed_commands = tuple(
             self._parse_allowed_command(command) for command in allowed_commands
         )
+        self.validation_command_argvs: tuple[tuple[str, ...], ...] = ()
         # This is authorization state, not conversation state.  The digest is
         # of the raw bytes returned by a complete explicit read.
         self.fully_observed_files: dict[str, str] = {}
@@ -823,6 +1368,7 @@ class SandboxAgent:
         self.read_bytes = 0
         self.write_bytes = 0
         self.mutation_generation = 0
+        self.rollback_count = 0
 
     @staticmethod
     def _parse_allowed_command(command: str) -> tuple[str, ...]:
@@ -994,13 +1540,109 @@ class SandboxAgent:
         self.write_bytes += len(data)
         self.mutation_generation += 1
 
+    def _read_large_file_range(
+        self, relative: str, path: Path, start: int, end: int | None
+    ) -> str:
+        """Read a bounded line range from an oversized UTF-8 text file."""
+        selected: list[str] = []
+        selected_bytes = 0
+        selected_chars = 0
+        scanned_bytes = 0
+        line_number = 0
+        last_selected_newline = False
+        try:
+            stream = path.open("rb")
+        except OSError as exc:
+            raise AgentError(f"could not read UTF-8 file: {relative}") from exc
+
+        with stream:
+            while True:
+                raw_line = stream.readline(MAX_READ_BYTES + 1)
+                if not raw_line:
+                    break
+                line_number += 1
+                scanned_bytes += len(raw_line)
+                self.read_bytes += len(raw_line)
+                if scanned_bytes > MAX_RANGE_READ_SCAN_BYTES:
+                    raise AgentError(
+                        f"line range scan exceeds byte limit: {relative}; use grep "
+                        "to locate a narrower range"
+                    )
+
+                if end is not None and line_number > end:
+                    break
+                is_selected = line_number >= start and (
+                    end is None or line_number <= end
+                )
+                if len(raw_line) > MAX_READ_BYTES:
+                    if is_selected:
+                        raise AgentError(
+                            f"selected line exceeds read limit: {relative}:{line_number}"
+                        )
+                    while raw_line and not raw_line.endswith(b"\n"):
+                        raw_line = stream.readline(MAX_READ_BYTES + 1)
+                        if not raw_line:
+                            break
+                        scanned_bytes += len(raw_line)
+                        self.read_bytes += len(raw_line)
+                        if scanned_bytes > MAX_RANGE_READ_SCAN_BYTES:
+                            raise AgentError(
+                                f"line range scan exceeds byte limit: {relative}; "
+                                "use grep to locate a narrower range"
+                            )
+                    if end is not None and line_number >= end:
+                        break
+                    continue
+
+                if line_number < start:
+                    continue
+                if end is not None and line_number > end:
+                    break
+                if b"\x00" in raw_line:
+                    raise AgentError(f"binary file rejected: {relative}")
+                try:
+                    text_line = raw_line.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    raise AgentError(f"could not read UTF-8 file: {relative}") from exc
+                ended_with_newline = text_line.endswith("\n")
+                if ended_with_newline:
+                    text_line = text_line[:-1]
+                    if text_line.endswith("\r"):
+                        text_line = text_line[:-1]
+                elif text_line.endswith("\r"):
+                    text_line = text_line[:-1]
+
+                separator_size = 1 if selected else 0
+                line_bytes = len(text_line.encode("utf-8"))
+                next_bytes = selected_bytes + line_bytes + separator_size
+                next_chars = selected_chars + len(text_line) + separator_size
+                if next_bytes > MAX_READ_BYTES or next_chars > MAX_READ_CHARS:
+                    raise AgentError(
+                        f"line range exceeds read response limit: {relative}; "
+                        "request a narrower range"
+                    )
+                selected.append(text_line)
+                selected_bytes = next_bytes
+                selected_chars = next_chars
+                last_selected_newline = ended_with_newline
+                if end is not None and line_number >= end:
+                    break
+
+        content = "\n".join(selected)
+        if end is None and selected and last_selected_newline:
+            if selected_bytes + 1 > MAX_READ_BYTES or selected_chars + 1 > MAX_READ_CHARS:
+                raise AgentError(
+                    f"line range exceeds read response limit: {relative}; "
+                    "request a narrower range"
+                )
+            content += "\n"
+        return content
+
     def _read_action(self, action: dict[str, Any]) -> dict[str, Any]:
         relative, path = self._resolve(
             action.get("path"), readable=True, must_exist=True
         )
         canonical = self._canonical_identity(path)
-        snapshot = self._read_file(relative, path)
-        text = snapshot.text
         start = action.get("start_line", 1)
         end = action.get("end_line")
         if isinstance(start, bool) or not isinstance(start, int) or start < 1:
@@ -1009,6 +1651,27 @@ class SandboxAgent:
             isinstance(end, bool) or not isinstance(end, int) or end < start
         ):
             raise AgentError("end_line must be an integer after start_line")
+        try:
+            size = path.stat().st_size
+        except OSError as exc:
+            raise AgentError(f"could not stat file: {relative}") from exc
+        if size > MAX_READ_BYTES:
+            if start == 1 and end is None:
+                raise AgentError(
+                    f"file exceeds read limit: {relative}; use start_line/end_line "
+                    "or grep to inspect a bounded portion"
+                )
+            content = self._read_large_file_range(relative, path, start, end)
+            self.fully_observed_files.pop(canonical, None)
+            return {
+                "ok": True,
+                "action": "read",
+                "path": relative,
+                "content": content,
+            }
+
+        snapshot = self._read_file(relative, path)
+        text = snapshot.text
         if start == 1 and end is None:
             content = text
         else:
@@ -1018,7 +1681,7 @@ class SandboxAgent:
             if selected and text.endswith("\n") and end is None:
                 content += "\n"
         complete = True
-        if len(content.encode("utf-8")) > MAX_READ_CHARS:
+        if len(content) > MAX_READ_CHARS:
             content = content[:MAX_READ_CHARS] + "\n[truncated]"
             complete = False
         if complete and start == 1 and end is None and content == text:
@@ -1156,8 +1819,26 @@ class SandboxAgent:
         matches: list[str] = []
         total_chars = 0
         total_bytes = 0
+        total_file_bytes = 0
         files_scanned = 0
+        byte_limit_hit = False
         for relative, path in files:
+            try:
+                file_size = path.stat().st_size
+            except OSError:
+                skipped_reasons["unreadable"] = skipped_reasons.get("unreadable", 0) + 1
+                continue
+            if file_size > MAX_GREP_FILE_BYTES:
+                skipped_reasons["file_too_large"] = (
+                    skipped_reasons.get("file_too_large", 0) + 1
+                )
+                continue
+            if total_file_bytes + file_size > MAX_GREP_TOTAL_BYTES:
+                skipped_reasons["total_byte_limit"] = (
+                    skipped_reasons.get("total_byte_limit", 0) + 1
+                )
+                byte_limit_hit = True
+                break
             try:
                 snapshot = self._read_file(
                     relative,
@@ -1170,6 +1851,7 @@ class SandboxAgent:
                 skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
                 continue
             files_scanned += 1
+            total_file_bytes += len(snapshot.data)
             for line_number, line in enumerate(snapshot.text.splitlines(), 1):
                 if query not in line:
                     continue
@@ -1202,9 +1884,15 @@ class SandboxAgent:
                     )
         if file_limit_hit:
             skipped_reasons["file_limit"] = skipped_reasons.get("file_limit", 0) + 1
-        incomplete = bool(skipped_reasons)
+        incomplete = bool(skipped_reasons) or byte_limit_hit
         truncation_reason = (
-            "file_limit" if file_limit_hit else ("file_skip" if incomplete else None)
+            "file_limit"
+            if file_limit_hit
+            else (
+                "byte_limit"
+                if byte_limit_hit
+                else ("file_skip" if incomplete else None)
+            )
         )
         return self._grep_result(
             matches,
@@ -1314,11 +2002,17 @@ class SandboxAgent:
         self, scratch_path: Path, *, validation: bool
     ) -> CommandAccessPolicy:
         return CommandAccessPolicy(
-            readable_paths=self._command_scope_paths(
-                self._readable_command_scopes
+            readable_paths=(
+                self._command_scope_paths(
+                    self.validation_read_scopes
+                    if self.validation_read_scopes
+                    else self._readable_command_scopes
+                )
+                if validation
+                else self._command_scope_paths(self._readable_command_scopes)
             ),
             writable_paths=(
-                ()
+                self._command_scope_paths(self.validation_output_scopes)
                 if validation
                 else self._command_scope_paths(self._writable_command_scopes)
             ),
@@ -1362,7 +2056,9 @@ class SandboxAgent:
                     ) from exc
                 tracked_bytes += len(data)
                 snapshots[relative] = _CommandPathSnapshot(
-                    f"file:{permissions:o}", hashlib.sha256(data).hexdigest()
+                    f"file:{permissions:o}",
+                    hashlib.sha256(data).hexdigest(),
+                    content=data,
                 )
                 return
             if stat.S_ISLNK(mode):
@@ -1373,7 +2069,9 @@ class SandboxAgent:
                         "command mutation snapshot could not inspect symlink"
                     ) from exc
                 snapshots[relative] = _CommandPathSnapshot(
-                    "symlink", hashlib.sha256(os.fsencode(target)).hexdigest()
+                    "symlink",
+                    hashlib.sha256(os.fsencode(target)).hexdigest(),
+                    symlink_target=target,
                 )
                 return
             if stat.S_ISDIR(mode):
@@ -1401,7 +2099,7 @@ class SandboxAgent:
         self,
         before: dict[str, _CommandPathSnapshot],
         after: dict[str, _CommandPathSnapshot],
-    ) -> None:
+    ) -> list[str]:
         changed = {
             relative
             for relative in set(before) | set(after)
@@ -1411,6 +2109,85 @@ class SandboxAgent:
             self._invalidate_all_observations()
             self.changed_paths.update(changed)
             self.mutation_generation += 1
+        return sorted(changed)
+
+    def _restore_writable_state(
+        self,
+        before: dict[str, _CommandPathSnapshot],
+        after: dict[str, _CommandPathSnapshot],
+    ) -> list[str]:
+        """Roll back a failed command's changes within the writable scopes."""
+        changed = sorted(
+            (
+                relative
+                for relative in set(before) | set(after)
+                if before.get(relative) != after.get(relative)
+            ),
+            key=lambda relative: (len(Path(relative).parts), relative),
+            reverse=True,
+        )
+        try:
+            for relative in changed:
+                snapshot = before.get(relative)
+                path = self.root / relative
+                if snapshot is None or snapshot.kind == "missing":
+                    if path.is_dir() and not path.is_symlink():
+                        shutil.rmtree(path)
+                    else:
+                        path.unlink(missing_ok=True)
+                    continue
+
+                if snapshot.kind.startswith("directory:"):
+                    if path.is_symlink() or (path.exists() and not path.is_dir()):
+                        path.unlink()
+                    path.mkdir(parents=True, exist_ok=True)
+                    os.chmod(path, int(snapshot.kind.split(":", 1)[1], 8))
+                    continue
+
+                if snapshot.kind.startswith("file:"):
+                    if snapshot.content is None:
+                        raise AgentError("checkpoint is missing file contents")
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    with tempfile.NamedTemporaryFile(
+                        mode="wb",
+                        dir=path.parent,
+                        prefix=f".{path.name}.qwen-rollback-",
+                        delete=False,
+                    ) as temporary:
+                        temporary_name = temporary.name
+                        temporary.write(snapshot.content)
+                        temporary.flush()
+                        os.fsync(temporary.fileno())
+                    try:
+                        if path.is_dir() and not path.is_symlink():
+                            shutil.rmtree(path)
+                        elif path.exists() or path.is_symlink():
+                            path.unlink()
+                        os.chmod(
+                            temporary_name,
+                            int(snapshot.kind.split(":", 1)[1], 8),
+                        )
+                        os.replace(temporary_name, path)
+                    finally:
+                        Path(temporary_name).unlink(missing_ok=True)
+                    continue
+
+                if snapshot.kind == "symlink":
+                    if snapshot.symlink_target is None:
+                        raise AgentError("checkpoint is missing symlink target")
+                    if path.exists() or path.is_symlink():
+                        if path.is_dir() and not path.is_symlink():
+                            shutil.rmtree(path)
+                        else:
+                            path.unlink()
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    path.symlink_to(snapshot.symlink_target)
+                    continue
+
+                raise AgentError("checkpoint contains an unsupported file type")
+        except (OSError, ValueError) as exc:
+            raise AgentError("failed command changes could not be rolled back") from exc
+        return changed
 
     def _run_command_argv(
         self, argv: tuple[str, ...], *, validation: bool
@@ -1418,6 +2195,9 @@ class SandboxAgent:
         executable = _resolve_command_executable(argv[0], self.root)
         sandbox = _discover_command_sandbox()
         before = None if validation else self._snapshot_writable_state()
+        completed: CommandResult | None = None
+        rolled_back_paths: list[str] = []
+        command_changed_paths: list[str] = []
         try:
             with tempfile.TemporaryDirectory(prefix="qwen-command-") as directory:
                 scratch_path = Path(directory).resolve(strict=True)
@@ -1431,11 +2211,29 @@ class SandboxAgent:
                     environment=_safe_environment(scratch_path),
                     timeout=COMMAND_TIMEOUT_SECONDS,
                 )
+                if completed.returncode == 0 and _flutter_cache_access_denied(
+                    executable,
+                    self.root,
+                    completed.stdout + "\n" + completed.stderr,
+                ):
+                    completed = CommandResult(
+                        1,
+                        completed.stdout,
+                        completed.stderr
+                        + "\nFlutter SDK cache access was denied by the command sandbox.",
+                    )
         finally:
             if before is not None:
                 try:
-                    self._record_command_mutations(
-                        before, self._snapshot_writable_state()
+                    after = self._snapshot_writable_state()
+                    if completed is None or completed.returncode != 0:
+                        rolled_back_paths = self._restore_writable_state(
+                            before, after
+                        )
+                        self.rollback_count += len(rolled_back_paths)
+                        after = self._snapshot_writable_state()
+                    command_changed_paths = self._record_command_mutations(
+                        before, after
                     )
                 except AgentError:
                     # A post-command tracking failure must invalidate validation
@@ -1443,7 +2241,9 @@ class SandboxAgent:
                     self._invalidate_all_observations()
                     self.mutation_generation += 1
                     raise
-        return {
+        if completed is None:
+            raise AgentError("command did not return a result")
+        result = {
             "ok": completed.returncode == 0,
             "action": "run",
             "command": " ".join(argv),
@@ -1455,13 +2255,21 @@ class SandboxAgent:
                 completed.stderr, scratch_path
             )[-MAX_COMMAND_OUTPUT_CHARS:],
         }
+        if rolled_back_paths:
+            result["rolled_back_paths"] = rolled_back_paths
+        if command_changed_paths:
+            result["changed_paths"] = command_changed_paths
+        return result
 
     def _run_action(self, action: dict[str, Any]) -> dict[str, Any]:
         command = action.get("command")
         argv = _parse_command(command)
         if not _command_allowed(argv, self.allowed_commands):
             raise AgentError(f"command is not allowlisted: {command}")
-        return self._run_command_argv(argv, validation=False)
+        return self._run_command_argv(
+            argv,
+            validation=argv in self.validation_command_argvs,
+        )
 
     def run_validation_command(self, argv: tuple[str, ...]) -> dict[str, Any]:
         if not _command_allowed(argv, self.allowed_commands):
@@ -1622,13 +2430,37 @@ class ValidationState:
     phase: ValidationPhase = ValidationPhase.EDITING
     validation_rounds: int = 0
     last_results: tuple[ValidationResult, ...] = ()
+    failures_total: int = 0
     mutation_generation: int = 0
     validated_generation: int | None = None
+    repair_required: bool = False
 
     def mark_mutation(self, generation: int) -> None:
         self.mutation_generation = generation
         self.phase = ValidationPhase.EDITING
         self.validated_generation = None
+        self.repair_required = False
+
+    def mark_required_validation_passed(self) -> None:
+        self.repair_required = False
+
+    def finish_post_edit_check(
+        self,
+        results: Iterable[ValidationResult],
+        generation: int,
+    ) -> bool:
+        self.last_results = tuple(results)
+        self.failures_total += sum(not result.passed for result in self.last_results)
+        self.mutation_generation = generation
+        if self.last_results and all(result.passed for result in self.last_results):
+            self.phase = ValidationPhase.VALIDATED
+            self.validated_generation = generation
+            self.repair_required = False
+            return True
+        self.phase = ValidationPhase.FAILED
+        self.validated_generation = None
+        self.repair_required = True
+        return False
 
     def mark_model_done(self) -> None:
         self.phase = ValidationPhase.MODEL_DONE
@@ -1650,13 +2482,16 @@ class ValidationState:
         generation: int,
     ) -> bool:
         self.last_results = tuple(results)
+        self.failures_total += sum(not result.passed for result in self.last_results)
         self.mutation_generation = generation
         if self.last_results and all(result.passed for result in self.last_results):
             self.phase = ValidationPhase.VALIDATED
             self.validated_generation = generation
+            self.repair_required = False
             return True
         self.phase = ValidationPhase.FAILED
         self.validated_generation = None
+        self.repair_required = True
         return False
 
     @property
@@ -1837,6 +2672,116 @@ def _command_scope_predicate(
     return f"({operation} {parameter})"
 
 
+def _approved_developer_directory(path: Path) -> Path | None:
+    try:
+        resolved = path.resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+    if not resolved.is_dir():
+        return None
+
+    command_line_tools = Path("/Library/Developer/CommandLineTools")
+    try:
+        if resolved == command_line_tools.resolve(strict=True):
+            return resolved
+    except (FileNotFoundError, OSError, RuntimeError):
+        pass
+
+    applications = Path("/Applications")
+    try:
+        relative = resolved.relative_to(applications)
+    except ValueError:
+        return None
+    if (
+        len(relative.parts) == 3
+        and relative.parts[0].casefold().startswith("xcode")
+        and relative.parts[0].casefold().endswith(".app")
+        and relative.parts[1:] == ("Contents", "Developer")
+    ):
+        return resolved
+    return None
+
+
+def _approved_flutter_sdk_paths(
+    executable: Path, sandbox_root: Path
+) -> tuple[Path, Path] | None:
+    """Return a Flutter SDK root and cache dir for host validation only."""
+    try:
+        resolved = executable.resolve(strict=True)
+        if resolved.name.casefold() != "flutter" or resolved.parent.name.casefold() != "bin":
+            return None
+        sdk_root = resolved.parent.parent.resolve(strict=True)
+        cache_path = (resolved.parent / "cache").resolve(strict=True)
+    except (FileNotFoundError, OSError, RuntimeError):
+        return None
+    if (
+        not sdk_root.is_dir()
+        or not cache_path.is_dir()
+        or cache_path == sdk_root
+        or not _within(sdk_root, cache_path)
+        or _within(sandbox_root, sdk_root)
+        or _within(sdk_root, sandbox_root)
+    ):
+        return None
+    return sdk_root, cache_path
+
+
+def _flutter_cache_access_denied(
+    executable: Path, sandbox_root: Path, output: str
+) -> bool:
+    paths = _approved_flutter_sdk_paths(executable, sandbox_root)
+    if paths is None:
+        return False
+    cache_path = str(paths[1])
+    permission_errors = (
+        "operation not permitted",
+        "permission denied",
+        "read-only file system",
+    )
+    return any(
+        cache_path in line
+        and any(marker in line.casefold() for marker in permission_errors)
+        for line in output.splitlines()
+    )
+
+
+def _active_developer_directory() -> Path | None:
+    """Read the host-selected Apple toolchain for validation commands only."""
+    if sys.platform != "darwin":
+        return None
+    executable = Path("/usr/bin/xcode-select")
+    if not executable.is_file() or not os.access(executable, os.X_OK):
+        return None
+    try:
+        result = subprocess.run(
+            [str(executable), "-p"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            env=_safe_environment(),
+            shell=False,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0 or len(result.stdout) > MAX_PATH_BYTES:
+        return None
+    try:
+        output = result.stdout.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+    if len(output) > MAX_PATH_CHARS:
+        return None
+    value = output.rstrip("\r\n")
+    if not value or "\n" in value or "\r" in value:
+        return None
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        return None
+    return _approved_developer_directory(candidate)
+
+
 def _macos_runtime_paths(executable: Path) -> tuple[Path, ...]:
     candidates = [
         Path("/System"),
@@ -1873,7 +2818,17 @@ def _macos_sandbox_profile(
     sandbox_root: Path,
     executable: Path,
     access_policy: CommandAccessPolicy,
+    *,
+    active_developer_directory: Path | None = None,
 ) -> tuple[str, tuple[tuple[str, str], ...]]:
+    developer_directory = None
+    if access_policy.validation and active_developer_directory is not None:
+        developer_directory = _approved_developer_directory(
+            active_developer_directory
+        )
+        if developer_directory is None:
+            raise AgentError("active developer directory is not supported")
+
     parameters: list[tuple[str, str]] = [
         ("SANDBOX_ROOT", str(sandbox_root)),
         ("EXECUTABLE", str(executable)),
@@ -1917,7 +2872,17 @@ def _macos_sandbox_profile(
             rules.append(
                 f"(allow file-read-metadata file-test-existence (path-ancestors {parameter}))"
             )
-    for index, path in enumerate(_macos_runtime_paths(executable)):
+    runtime_paths = list(_macos_runtime_paths(executable))
+    flutter_cache_path = None
+    if developer_directory is not None and developer_directory not in runtime_paths:
+        runtime_paths.append(developer_directory)
+    if access_policy.validation:
+        flutter_paths = _approved_flutter_sdk_paths(executable, sandbox_root)
+        if flutter_paths is not None:
+            flutter_sdk_root, flutter_cache_path = flutter_paths
+            if flutter_sdk_root not in runtime_paths:
+                runtime_paths.append(flutter_sdk_root)
+    for index, path in enumerate(runtime_paths):
         parameter_name = f"RUNTIME_{index}"
         parameters.append((parameter_name, str(path)))
         parameter = _sbpl_parameter(parameter_name)
@@ -1927,6 +2892,14 @@ def _macos_sandbox_profile(
                 f"(allow process-exec (subpath {parameter}))",
                 f"(allow process-exec-interpreter (subpath {parameter}))",
                 f"(allow file-read-metadata file-test-existence (path-ancestors {parameter}))",
+            ]
+        )
+    if flutter_cache_path is not None:
+        parameters.append(("FLUTTER_CACHE", str(flutter_cache_path)))
+        rules.extend(
+            [
+                f"(allow file-write* (subpath {_sbpl_parameter('FLUTTER_CACHE')}))",
+                f"(allow file-read-metadata file-test-existence (path-ancestors {_sbpl_parameter('FLUTTER_CACHE')}))",
             ]
         )
     # SBPL uses the last matching rule; keep these denials after all declared
@@ -2102,8 +3075,18 @@ class MacOSCommandSandbox(CommandSandbox):
         timeout: float,
     ) -> CommandResult:
         executable = Path(argv[0])
+        developer_directory = (
+            _active_developer_directory() if access_policy.validation else None
+        )
+        command_environment = dict(environment)
+        command_environment.pop("DEVELOPER_DIR", None)
+        if developer_directory is not None:
+            command_environment["DEVELOPER_DIR"] = str(developer_directory)
         profile, parameters = _macos_sandbox_profile(
-            sandbox_root, executable, access_policy
+            sandbox_root,
+            executable,
+            access_policy,
+            active_developer_directory=developer_directory,
         )
         command = [str(self.sandbox_exec)]
         for name, value in parameters:
@@ -2113,7 +3096,7 @@ class MacOSCommandSandbox(CommandSandbox):
             process = subprocess.Popen(
                 command,
                 cwd=sandbox_root,
-                env=environment,
+                env=command_environment,
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -2177,8 +3160,20 @@ def _validate_agent_request_inputs(
     read_only: Any,
     allowed_commands: Any,
     validation_commands: Any,
+    validation_read_paths: Any,
+    validation_output_paths: Any,
     validation_failure: Any,
-) -> tuple[str, str, list[str], list[str], list[str], list[str], str | None]:
+) -> tuple[
+    str,
+    str,
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+    list[str],
+    str | None,
+]:
     task = _validate_task_text(task)
     sandbox_value = validate_text(
         str(sandbox) if isinstance(sandbox, Path) else sandbox,
@@ -2229,6 +3224,34 @@ def _validate_agent_request_inputs(
         max_bytes=MAX_COMMAND_BYTES,
         max_chars=MAX_COMMAND_CHARS,
     )
+    validation_read_values = validate_string_list(
+        _request_list(
+            validation_read_paths
+            if validation_read_paths is not None
+            else [],
+            "validation_read_paths",
+        ),
+        field="validation_read_paths",
+        max_items=MAX_VALIDATION_READ_PATHS,
+        count_code="TOO_MANY_VALIDATION_READ_PATHS",
+        item_kind="path",
+        max_bytes=MAX_PATH_BYTES,
+        max_chars=MAX_PATH_CHARS,
+    )
+    validation_output_values = validate_string_list(
+        _request_list(
+            validation_output_paths
+            if validation_output_paths is not None
+            else [],
+            "validation_output_paths",
+        ),
+        field="validation_output_paths",
+        max_items=MAX_VALIDATION_OUTPUT_PATHS,
+        count_code="TOO_MANY_VALIDATION_OUTPUT_PATHS",
+        item_kind="path",
+        max_bytes=MAX_PATH_BYTES,
+        max_chars=MAX_PATH_CHARS,
+    )
     if validation_failure is not None:
         validation_failure = validate_text(
             validation_failure,
@@ -2244,6 +3267,8 @@ def _validate_agent_request_inputs(
         _dedupe_preserving_order(read_only_values),
         _dedupe_preserving_order(allowed_command_values),
         validation_command_values,
+        _dedupe_preserving_order(validation_read_values),
+        _dedupe_preserving_order(validation_output_values),
         validation_failure,
     )
 
@@ -2287,6 +3312,12 @@ def _error_kind(exc: BaseException, *, stage: str) -> str:
     ):
         if endpoint_kind in message:
             return endpoint_kind
+    for agent_kind in (
+        "agent_discovery_limit",
+        "agent_done_without_repair",
+    ):
+        if agent_kind in message:
+            return agent_kind.removeprefix("agent_")
     for stream_kind in (
         "generation_deadline",
         "agent_generation_deadline",
@@ -2344,6 +3375,79 @@ def _validate_task_text(task: str) -> str:
     return task
 
 
+def _json_schema_type_matches(value: Any, schema: dict[str, Any]) -> bool:
+    value_type = schema.get("type")
+    if value_type == "string":
+        return isinstance(value, str)
+    if value_type == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if value_type == "array":
+        if not isinstance(value, list):
+            return False
+        item_schema = schema.get("items")
+        return item_schema is None or all(
+            _json_schema_type_matches(item, item_schema) for item in value
+        )
+    if value_type == "object":
+        return isinstance(value, dict)
+    if value_type == "boolean":
+        return isinstance(value, bool)
+    if value_type == "number":
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+        )
+    return True
+
+
+def _validate_action_shape(value: dict[str, Any]) -> None:
+    action_name = value.get("action")
+    alternatives = (
+        AGENT_RESPONSE_FORMAT.get("json_schema", {})
+        .get("schema", {})
+        .get("oneOf", [])
+    )
+    matching = [
+        item
+        for item in alternatives
+        if isinstance(item, dict)
+        and isinstance(item.get("properties"), dict)
+        and isinstance(item["properties"].get("action"), dict)
+        and action_name in item["properties"]["action"].get("enum", [])
+    ]
+    if len(matching) != 1:
+        raise AgentError(f"unsupported action: {action_name!r}")
+
+    alternative = matching[0]
+    properties = alternative.get("properties", {})
+    required = alternative.get("required", [])
+    missing = [field for field in required if field not in value]
+    if missing:
+        raise AgentError(
+            f"{action_name} action is missing required field: {missing[0]}"
+        )
+    if alternative.get("additionalProperties") is False:
+        extra = sorted(set(value) - set(properties))
+        if extra:
+            raise AgentError(
+                f"{action_name} action has unsupported field: {extra[0]}"
+            )
+    for field, field_value in value.items():
+        field_schema = properties.get(field)
+        if not isinstance(field_schema, dict):
+            continue
+        if not _json_schema_type_matches(field_value, field_schema):
+            raise AgentError(
+                f"{action_name} action field {field} must be "
+                f"{field_schema.get('type', 'valid')}"
+            )
+        allowed_values = field_schema.get("enum")
+        if allowed_values is not None and field_value not in allowed_values:
+            raise AgentError(
+                f"{action_name} action field {field} has an unsupported value"
+            )
+
+
 def parse_action(text: str) -> dict[str, Any]:
     if not isinstance(text, str) or not text.strip():
         raise AgentError("model returned an empty action")
@@ -2365,6 +3469,7 @@ def parse_action(text: str) -> dict[str, Any]:
         raise AgentError("model action must be a JSON object")
     if not isinstance(value.get("action"), str):
         raise AgentError("model action is missing an action name")
+    _validate_action_shape(value)
     return value
 
 
@@ -2374,6 +3479,7 @@ async def _parse_agent_stream(
     started: float,
     attempts: int,
     http_status: int,
+    response_format_warning: bool = False,
     limits: StreamLimits | None = None,
 ) -> AgentGeneration:
     limits = limits or StreamLimits(
@@ -2392,6 +3498,8 @@ async def _parse_agent_stream(
     reasoning_chars = 0
     reasoning_content_bytes = 0
     completion_tokens: int | None = None
+    prompt_tokens: int | None = None
+    total_tokens: int | None = None
     finish_reason: Any = None
     try:
         async for data in parser.iter_data(response):
@@ -2408,10 +3516,24 @@ async def _parse_agent_stream(
                     "AGENT_GENERATION_MALFORMED: event is not an object"
                 )
             usage = payload.get("usage")
-            if isinstance(usage, dict) and isinstance(
-                usage.get("completion_tokens"), int
-            ):
-                completion_tokens = usage["completion_tokens"]
+            if isinstance(usage, dict):
+                for field_name in (
+                    "prompt_tokens",
+                    "completion_tokens",
+                    "total_tokens",
+                ):
+                    count = usage.get(field_name)
+                    if (
+                        isinstance(count, int)
+                        and not isinstance(count, bool)
+                        and count >= 0
+                    ):
+                        if field_name == "prompt_tokens":
+                            prompt_tokens = count
+                        elif field_name == "completion_tokens":
+                            completion_tokens = count
+                        else:
+                            total_tokens = count
             choices = payload.get("choices")
             if choices == []:
                 continue
@@ -2538,6 +3660,9 @@ async def _parse_agent_stream(
         event_count=parser.event_count,
         final_content_bytes=final_content_bytes,
         reasoning_content_bytes=reasoning_content_bytes,
+        prompt_tokens=prompt_tokens,
+        total_tokens=total_tokens,
+        response_format_warning=response_format_warning,
     )
 
 
@@ -2547,52 +3672,101 @@ async def _generate_agent_turn(
     model: str,
     messages: list[dict[str, str]],
     *,
+    require_edit: bool = False,
+    editable_file_paths: Iterable[str] | None = None,
+    repair_read_path: str | None = None,
     sleep: Any = asyncio.sleep,
 ) -> AgentGeneration:
     started = time.monotonic()
+    response_format = (
+        _edit_response_format_for_paths(
+            editable_file_paths,
+            repair_read_path=repair_read_path,
+        )
+        if require_edit
+        else AGENT_RESPONSE_FORMAT
+    )
+    token_caps = (MAX_OUTPUT_TOKENS, 2048)
+    prefill_memory_retries = 0
+    generation_request_attempts = 0
     try:
         async with asyncio.timeout(MAX_GENERATION_SECONDS):
-            response, attempts = await _start_generation_request(
-                client,
-                f"{base_url}/chat/completions",
-                json={
-                    "model": model,
-                    "messages": messages,
-                    "max_tokens": MAX_OUTPUT_TOKENS,
-                    "temperature": TEMPERATURE,
-                    "top_p": TOP_P,
-                    "top_k": TOP_K,
-                    "presence_penalty": PRESENCE_PENALTY,
-                    "chat_template_kwargs": {"enable_thinking": False},
-                    "response_format": AGENT_RESPONSE_FORMAT,
-                    "stream": True,
-                    "stream_options": {"include_usage": True},
-                },
-                error_prefix="AGENT_GENERATION",
-                sleep=sleep,
-            )
-            try:
-                if not 200 <= response.status_code < 300:
-                    _retry_telemetry(
-                        operation="generation",
-                        method="POST",
-                        attempt=attempts,
-                        error_kind="http_status",
-                        retry=False,
-                    )
-                    excerpt = await _read_bounded_response_excerpt(response)
-                    raise RuntimeError(
-                        f"AGENT_GENERATION_HTTP attempts={attempts} "
-                        f"status={response.status_code}: {excerpt}"
-                    )
-                return await _parse_agent_stream(
-                    response,
-                    started=started,
-                    attempts=attempts,
-                    http_status=response.status_code,
+            for token_cap_index, token_cap in enumerate(token_caps):
+                response, attempts = await _start_generation_request(
+                    client,
+                    f"{base_url}/chat/completions",
+                    json={
+                        "model": model,
+                        "messages": messages,
+                        "max_tokens": token_cap,
+                        "temperature": TEMPERATURE,
+                        "top_p": TOP_P,
+                        "top_k": TOP_K,
+                        "presence_penalty": PRESENCE_PENALTY,
+                        "chat_template_kwargs": {"enable_thinking": False},
+                        "response_format": response_format,
+                        "stream": True,
+                        "stream_options": {"include_usage": True},
+                    },
+                    error_prefix="AGENT_GENERATION",
+                    sleep=sleep,
                 )
-            finally:
-                await response.aclose()
+                generation_request_attempts += attempts
+                try:
+                    if not 200 <= response.status_code < 300:
+                        excerpt = await _read_bounded_response_excerpt(response)
+                        is_prefill_memory_error = (
+                            "prefill_memory_exceeded" in excerpt.casefold()
+                        )
+                        should_retry = (
+                            is_prefill_memory_error
+                            and token_cap_index + 1 < len(token_caps)
+                        )
+                        _retry_telemetry(
+                            operation="generation",
+                            method="POST",
+                            attempt=generation_request_attempts,
+                            error_kind=(
+                                "prefill_memory_exceeded"
+                                if is_prefill_memory_error
+                                else "http_status"
+                            ),
+                            retry=should_retry,
+                        )
+                        if should_retry:
+                            prefill_memory_retries += 1
+                            continue
+                        raise RuntimeError(
+                            f"AGENT_GENERATION_HTTP attempts="
+                            f"{generation_request_attempts} "
+                            f"generation_token_cap={token_cap} "
+                            f"prefill_memory_retries={prefill_memory_retries} "
+                            f"status={response.status_code}: {excerpt}"
+                        )
+                    warning_header = response.headers.get("warning", "").casefold()
+                    response_format_warning = bool(
+                        "response_format" in warning_header
+                        and (
+                            "not enforced" in warning_header
+                            or "not schema-enforced" in warning_header
+                        )
+                    )
+                    generation = await _parse_agent_stream(
+                        response,
+                        started=started,
+                        attempts=generation_request_attempts,
+                        http_status=response.status_code,
+                        response_format_warning=response_format_warning,
+                    )
+                    return replace(
+                        generation,
+                        generation_request_attempts=generation_request_attempts,
+                        generation_token_cap=token_cap,
+                        prefill_memory_retries=prefill_memory_retries,
+                    )
+                finally:
+                    await response.aclose()
+            raise AssertionError("generation token-cap retry loop exhausted")
     except TimeoutError as exc:
         _retry_telemetry(
             operation="generation",
@@ -2611,6 +3785,58 @@ def _protocol_result(result: dict[str, Any]) -> str:
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"))
 
 
+def _action_trace_metadata(
+    action: dict[str, Any], result: dict[str, Any]
+) -> dict[str, Any]:
+    """Return useful per-action telemetry without logging source contents."""
+    action_json = json.dumps(
+        action, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    result_json = _protocol_result(result)
+    target = {
+        key: action[key]
+        for key in ("path", "paths", "query", "command")
+        if key in action
+    }
+    target_json = json.dumps(
+        target, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
+    path = result.get("path", action.get("path"))
+    paths = action.get("paths")
+    safe_paths = (
+        [value for value in paths[:50] if isinstance(value, str)]
+        if isinstance(paths, list)
+        else None
+    )
+    return {
+        "path": path if isinstance(path, str) else None,
+        "paths": safe_paths,
+        "action_sha256": hashlib.sha256(action_json.encode("utf-8")).hexdigest()[:16],
+        "target_sha256": hashlib.sha256(target_json.encode("utf-8")).hexdigest()[:16],
+        "result_sha256": hashlib.sha256(result_json.encode("utf-8")).hexdigest()[:16],
+        "action_bytes": len(action_json.encode("utf-8")),
+        "result_bytes": len(result_json.encode("utf-8")),
+        "result_ok": result.get("ok") if isinstance(result.get("ok"), bool) else None,
+        "returncode": result.get("returncode")
+        if isinstance(result.get("returncode"), int)
+        and not isinstance(result.get("returncode"), bool)
+        else None,
+    }
+
+
+def _aggregate_token_count(
+    values: list[int | None], model_calls: int
+) -> int | None:
+    """Return a total only when every model response reported that token field."""
+    if (
+        model_calls == 0
+        or len(values) != model_calls
+        or any(value is None for value in values)
+    ):
+        return None
+    return sum(value for value in values if value is not None)
+
+
 async def run_qwen_agent(
     task: str,
     sandbox: str | Path,
@@ -2619,18 +3845,43 @@ async def run_qwen_agent(
     read_only: list[str] | None = None,
     allowed_commands: list[str] | None = None,
     validation_commands: list[str] | None = None,
+    validation_read_paths: list[str] | None = None,
+    validation_output_paths: list[str] | None = None,
     validation_failure: str | None = None,
     max_actions: int = MAX_AGENT_ACTIONS,
+    resume: bool = False,
 ) -> AgentResult:
     task_id = _task_id()
     sandbox_name = "sandbox"
     started = time.monotonic()
     current_stage = "PRECHECK"
     model_calls = 0
-    completion_tokens = 0
+    prompt_token_counts: list[int | None] = []
+    completion_token_counts: list[int | None] = []
+    total_token_counts: list[int | None] = []
     reasoning_chars = 0
+    response_format_warnings = 0
+    generation_request_attempts = 0
+    prefill_memory_retries = 0
     protocol_errors = 0
+    protocol_error_streak = 0
+    post_edit_validation_runs = 0
+    post_edit_validation_failures = 0
     agent: SandboxAgent | None = None
+    pending_repair_read_path: str | None = None
+    progress_guard = ActionProgressGuard()
+
+    def token_metrics() -> dict[str, Any]:
+        return {
+            "prompt_tokens": _aggregate_token_count(prompt_token_counts, model_calls),
+            "completion_tokens": _aggregate_token_count(
+                completion_token_counts, model_calls
+            ),
+            "total_tokens": _aggregate_token_count(total_token_counts, model_calls),
+            "response_format_warnings": response_format_warnings,
+            "generation_request_attempts": generation_request_attempts,
+            "prefill_memory_retries": prefill_memory_retries,
+        }
 
     try:
         (
@@ -2640,6 +3891,8 @@ async def run_qwen_agent(
             read_only_values,
             allowed_command_values,
             validation_command_values,
+            validation_read_values,
+            validation_output_values,
             validation_failure,
         ) = _validate_agent_request_inputs(
             task,
@@ -2648,12 +3901,18 @@ async def run_qwen_agent(
             read_only if read_only is not None else [],
             allowed_commands if allowed_commands is not None else [],
             validation_commands if validation_commands is not None else [],
+            validation_read_paths if validation_read_paths is not None else [],
+            validation_output_paths
+            if validation_output_paths is not None
+            else [],
             validation_failure,
         )
         if isinstance(max_actions, bool) or not isinstance(max_actions, int):
             raise AgentError("max_actions must be an integer")
         if not 1 <= max_actions <= 100:
             raise AgentError("max_actions must be between 1 and 100")
+        if not isinstance(resume, bool):
+            raise AgentError("resume must be a boolean")
         ensure_request_budget(
             {
                 "task": task,
@@ -2662,8 +3921,11 @@ async def run_qwen_agent(
                 "read_only": read_only_values,
                 "allowed_commands": allowed_command_values,
                 "validation_commands": validation_command_values,
+                "validation_read_paths": validation_read_values,
+                "validation_output_paths": validation_output_values,
                 "validation_failure": validation_failure,
                 "max_actions": max_actions,
+                "resume": resume,
             }
         )
         sandbox_name = _sandbox_basename(sandbox)
@@ -2674,6 +3936,8 @@ async def run_qwen_agent(
             allow,
             read_only=read_only_values,
             allowed_commands=allowed_command_values,
+            validation_read_paths=validation_read_values,
+            validation_output_paths=validation_output_values,
         )
         _diagnostic(
             task_id,
@@ -2686,6 +3950,120 @@ async def run_qwen_agent(
         validation_policy = ValidationPolicy.from_commands(
             validation_command_values, agent.allowed_commands
         )
+        if (validation_read_values or validation_output_values) and not validation_policy.commands:
+            raise AgentError(
+                "validation read/output paths require a validation command"
+            )
+        agent.validation_command_argvs = validation_policy.commands
+        if resume and not validation_policy.commands:
+            raise AgentError("resume requires at least one host validation command")
+        validation_state = ValidationState()
+        validation_runner = ValidationRunner(agent, validation_policy)
+        validation_round_limit = MAX_VALIDATION_ROUNDS + int(resume)
+        if resume:
+            _diagnostic(
+                task_id,
+                sandbox_name,
+                "RESUME_VALIDATION",
+                "start",
+                validation_commands=validation_policy.count,
+            )
+
+            def report_resume_validation(
+                index: int, validation_result: ValidationResult
+            ) -> None:
+                _diagnostic(
+                    task_id,
+                    sandbox_name,
+                    "RESUME_VALIDATION_COMMAND",
+                    "ok" if validation_result.passed else "error",
+                    validation_command_index=index,
+                    returncode=validation_result.returncode,
+                )
+
+            resume_results = validation_runner.run(
+                on_result=report_resume_validation
+            )
+            validation_state.start_round(validation_round_limit)
+            if validation_state.finish_round(
+                resume_results, agent.mutation_generation
+            ):
+                _diagnostic(
+                    task_id,
+                    sandbox_name,
+                    "RESUME_VALIDATION",
+                    "ok",
+                    validation_round=validation_state.validation_rounds,
+                    validation_commands=validation_policy.count,
+                )
+                _diagnostic(
+                    task_id,
+                    sandbox_name,
+                    "DONE",
+                    "ok",
+                    result_status="validated",
+                    validated=True,
+                    resumed=True,
+                    actions=0,
+                    model_calls=0,
+                    **token_metrics(),
+                    reasoning_chars=0,
+                    read_bytes=agent.read_bytes,
+                    write_bytes=agent.write_bytes,
+                    validation_commands=validation_policy.count,
+                    validation_failures=validation_state.failures_total,
+                    validation_rounds=validation_state.validation_rounds,
+                    repeated_actions=progress_guard.repeated_actions,
+                    discovery_actions=progress_guard.discovery_actions,
+                    protocol_errors=protocol_errors,
+                    rollback_count=agent.rollback_count,
+                    elapsed_ms=_elapsed_ms(started),
+                )
+                model = validate_text(
+                    os.environ.get("QWEN_MODEL", DEFAULT_MODEL),
+                    field="model",
+                    max_bytes=MAX_MODEL_IDENTIFIER_BYTES,
+                    max_chars=MAX_MODEL_IDENTIFIER_CHARS,
+                    code="MODEL_IDENTIFIER_TOO_LONG",
+                )
+                return AgentResult(
+                    status="validated",
+                    actions=0,
+                    files_changed=sorted(agent.changed_paths),
+                    model_calls=0,
+                    completion_tokens=None,
+                    reasoning_chars=0,
+                    elapsed_ms=_elapsed_ms(started),
+                    read_bytes=agent.read_bytes,
+                    write_bytes=agent.write_bytes,
+                    validated=True,
+                    validation_commands=validation_policy.count,
+                    validation_failures=validation_state.failures_total,
+                    validation_rounds=validation_state.validation_rounds,
+                    prompt_tokens=None,
+                    total_tokens=None,
+                    model=model,
+                    repeated_actions=progress_guard.repeated_actions,
+                    discovery_actions=progress_guard.discovery_actions,
+                    protocol_errors=protocol_errors,
+                    rollback_count=agent.rollback_count,
+                )
+
+            validation_failure = "\n".join(
+                part
+                for part in (
+                    validation_failure,
+                    "RESUME_PREFLIGHT_FAILURES:\n"
+                    + "\n".join(
+                        _protocol_result(result.feedback(validation_round=1))
+                        for result in resume_results
+                        if not result.passed
+                    ),
+                )
+                if part
+            )
+            validation_state.prepare_retry()
+
         conversation = AgentConversation(
             task,
             allow,
@@ -2693,9 +4071,8 @@ async def run_qwen_agent(
             allowed_command_values,
             validation_failure,
             validation_policy.display_commands,
+            max_actions,
         )
-        validation_state = ValidationState()
-        validation_runner = ValidationRunner(agent, validation_policy)
         _diagnostic(
             task_id,
             sandbox_name,
@@ -2718,6 +4095,7 @@ async def run_qwen_agent(
             timeout=HTTP_TIMEOUT,
             trust_env=False,
             follow_redirects=False,
+            headers=_omlx_api_headers(),
         ) as client:
             preflight_attempts = await _preflight(client, base_url, model)
             _diagnostic(
@@ -2731,17 +4109,125 @@ async def run_qwen_agent(
                 model_calls += 1
                 current_stage = "MODEL_REQUEST"
                 messages, history_stats = conversation.snapshot()
+                writable_paths = [
+                    scope for scope, _is_directory in agent.writable_scopes
+                ]
+                exact_writable_files = (
+                    writable_paths
+                    if all(
+                        not is_directory
+                        for _scope, is_directory in agent.writable_scopes
+                    )
+                    else None
+                )
+                validation_retry_required = bool(
+                    validation_state.repair_required
+                    or progress_guard.failure_pending
+                )
+                baseline_repair_required = bool(
+                    validation_failure and agent.mutation_generation == 0
+                )
+                repair_discovery_limit = (
+                    DISCOVERY_ACTIONS_AFTER_FAILED_VALIDATION
+                    if validation_retry_required
+                    else DISCOVERY_ACTIONS_BEFORE_REQUIRED_EDIT
+                )
+                require_edit = bool(
+                    pending_repair_read_path is not None
+                    or (
+                        (baseline_repair_required or validation_retry_required)
+                        and progress_guard.discovery_actions
+                        >= repair_discovery_limit
+                    )
+                )
+                if require_edit:
+                    if exact_writable_files is not None:
+                        target_scope_instruction = (
+                            "The only writable file paths are: "
+                            + ", ".join(sorted(exact_writable_files))
+                            + ". Choose the implicated implementation from this list; "
+                            "do not target a test or read-only file."
+                        )
+                    else:
+                        target_scope_instruction = (
+                            "The writable scopes are: "
+                            + ", ".join(sorted(writable_paths))
+                            + ". Keep the repair inside those scopes and do not edit "
+                            "a test or read-only file."
+                        )
+                    if pending_repair_read_path is not None:
+                        edit_instruction = (
+                            "The previous source edit was rejected because the "
+                            "target file's current contents do not support that "
+                            "edit. The next action must read exactly "
+                            f"{pending_repair_read_path} once to refresh the source "
+                            "before editing. After reading, choose a unique current "
+                            "replacement anchor. Use a targeted replace for an "
+                            "existing file unless you have completely read it. Do "
+                            "not repeat the rejected edit or inspect another file."
+                        )
+                    elif validation_retry_required:
+                        edit_instruction = (
+                            "A compiler or test failure is still unresolved. You "
+                            f"have used {progress_guard.discovery_actions} targeted "
+                            "discovery actions since that failure. The next action "
+                            "must be a small in-scope replace or write to the "
+                            "implicated implementation, based on the retained "
+                            "diagnostic and verified API declarations. Do not read, "
+                            "grep, or finish before making the repair."
+                        )
+                    else:
+                        edit_instruction = (
+                            "The supplied baseline validation is failing and you "
+                            f"have already used {progress_guard.discovery_actions} "
+                            "discovery actions without a code change. The next "
+                            "action must be a small in-scope replace or write based "
+                            "on the retained file evidence. Do not read, grep, run, "
+                            "or finish before making that edit."
+                        )
+                    edit_instruction = (
+                        f"{edit_instruction}\n{target_scope_instruction}"
+                    )
+                    messages.append({"role": "user", "content": edit_instruction})
+                    history_chars = sum(len(message["content"]) for message in messages)
+                    if history_chars > MAX_AGENT_HISTORY_CHARS:
+                        raise AgentError("agent history budget enforcement failed")
+                    ensure_model_input(
+                        "\n".join(message["content"] for message in messages),
+                        field="agent_model_input",
+                    )
                 _diagnostic(
                     task_id,
                     sandbox_name,
                     current_stage,
                     "start",
                     model_call=model_calls,
+                    action_phase="edit_required" if require_edit else "discover_or_edit",
                     **history_stats,
                 )
-                generation = await _generate_agent_turn(
-                    client, base_url, model, messages
-                )
+                if require_edit:
+                    edit_generation_options: dict[str, Any] = {
+                        "require_edit": True
+                    }
+                    if exact_writable_files is not None:
+                        edit_generation_options["editable_file_paths"] = (
+                            exact_writable_files
+                        )
+                    if pending_repair_read_path is not None:
+                        edit_generation_options["repair_read_path"] = (
+                            pending_repair_read_path
+                        )
+                    generation = await _generate_agent_turn(
+                        client,
+                        base_url,
+                        model,
+                        messages,
+                        **edit_generation_options,
+                    )
+                else:
+                    generation = await _generate_agent_turn(
+                        client, base_url, model, messages
+                    )
                 _diagnostic(
                     task_id,
                     sandbox_name,
@@ -2750,7 +4236,12 @@ async def run_qwen_agent(
                     model_call=model_calls,
                     elapsed_ms=generation.elapsed_ms,
                 )
-                completion_tokens += generation.completion_tokens or 0
+                prompt_token_counts.append(generation.prompt_tokens)
+                completion_token_counts.append(generation.completion_tokens)
+                total_token_counts.append(generation.total_tokens)
+                response_format_warnings += int(generation.response_format_warning)
+                generation_request_attempts += generation.generation_request_attempts
+                prefill_memory_retries += generation.prefill_memory_retries
                 reasoning_chars += generation.reasoning_chars
                 current_stage = "MODEL_RESPONSE"
                 _diagnostic(
@@ -2759,7 +4250,9 @@ async def run_qwen_agent(
                     current_stage,
                     "ok",
                     model_call=model_calls,
+                    prompt_tokens=generation.prompt_tokens,
                     completion_tokens=generation.completion_tokens,
+                    total_tokens=generation.total_tokens,
                     finish_reason=generation.finish_reason,
                     response_chars=generation.response_chars,
                     stream_bytes=generation.stream_bytes,
@@ -2767,11 +4260,35 @@ async def run_qwen_agent(
                     final_content_bytes=generation.final_content_bytes,
                     reasoning_content_bytes=generation.reasoning_content_bytes,
                     http_status=generation.http_status,
+                    response_format_warning=generation.response_format_warning,
+                    generation_request_attempts=generation.generation_request_attempts,
+                    generation_token_cap=generation.generation_token_cap,
+                    prefill_memory_retries=generation.prefill_memory_retries,
                 )
 
                 current_stage = "ACTION_PARSE"
                 try:
                     action = parse_action(generation.text)
+                    repair_read_allowed = (
+                        pending_repair_read_path is not None
+                        and action.get("action") == "read"
+                        and action.get("path") == pending_repair_read_path
+                    )
+                    if pending_repair_read_path is not None and not repair_read_allowed:
+                        raise AgentError(
+                            "AGENT_REPAIR_SOURCE_REFRESH_REQUIRED: the previous "
+                            "source edit was rejected; the next action must read "
+                            f"exactly {pending_repair_read_path} before editing"
+                        )
+                    if (
+                        require_edit
+                        and action.get("action") not in {"replace", "write"}
+                        and not repair_read_allowed
+                    ):
+                        raise AgentError(
+                            "AGENT_REPAIR_EDIT_REQUIRED: the baseline validation "
+                            "failed; choose an in-scope replace or write action"
+                        )
                 except AgentError as exc:
                     _diagnostic(
                         task_id,
@@ -2783,7 +4300,8 @@ async def run_qwen_agent(
                         response_chars=len(generation.text),
                     )
                     protocol_errors += 1
-                    if protocol_errors > MAX_PROTOCOL_ERRORS:
+                    protocol_error_streak += 1
+                    if protocol_error_streak > MAX_PROTOCOL_ERRORS:
                         raise RuntimeError(f"AGENT_PROTOCOL_FAILED: {exc}") from exc
                     result = {"ok": False, "error": str(exc)}
                     result_content = _protocol_result(result)
@@ -2824,34 +4342,290 @@ async def run_qwen_agent(
                     action_type=action.get("action"),
                 )
                 mutation_generation_before = agent.mutation_generation
-                try:
-                    result = agent.execute(action)
-                except AgentError as exc:
+                if (
+                    action.get("action") == "done"
+                    and validation_state.repair_required
+                ):
+                    result = {
+                        "ok": False,
+                        "action": "done",
+                        "error": (
+                            "validation_repair_required: a required host check "
+                            "failed after the last code state. Make a relevant "
+                            "in-scope change or run the failing required "
+                            "validation command successfully before finishing."
+                        ),
+                    }
                     _diagnostic(
                         task_id,
                         sandbox_name,
                         current_stage,
                         "error",
                         model_call=model_calls,
-                        kind=_error_kind(exc, stage=current_stage),
+                        kind="validation_repair_required",
                     )
-                    protocol_errors += 1
-                    if protocol_errors > MAX_PROTOCOL_ERRORS:
-                        raise RuntimeError(f"AGENT_ACTION_FAILED: {exc}") from exc
-                    result = {"ok": False, "error": str(exc)}
-                else:
-                    protocol_errors = 0
+                elif progress_guard.is_previously_failed_edit(action):
+                    result = {
+                        "ok": False,
+                        "action": action.get("action"),
+                        "error": (
+                            "AGENT_IDENTICAL_FAILED_EDIT: this exact source edit "
+                            "was already applied and its immediate compiler/test "
+                            "validation failed. Do not repeat it."
+                        ),
+                        "repair_directive": (
+                            "Do not repeat this edit. Use the retained validation "
+                            "diagnostic and last edit summary to change a different "
+                            "relevant part of the implementation, then run the "
+                            "required validation."
+                        ),
+                    }
                     _diagnostic(
                         task_id,
                         sandbox_name,
                         current_stage,
-                        "ok",
+                        "error",
+                        model_call=model_calls,
+                        kind="identical_failed_edit",
+                    )
+                else:
+                    try:
+                        result = agent.execute(action)
+                    except AgentError as exc:
+                        _diagnostic(
+                            task_id,
+                            sandbox_name,
+                            current_stage,
+                            "error",
+                            model_call=model_calls,
+                            kind=_error_kind(exc, stage=current_stage),
+                        )
+                        protocol_errors += 1
+                        protocol_error_streak += 1
+                        if protocol_error_streak > MAX_PROTOCOL_ERRORS:
+                            raise RuntimeError(f"AGENT_ACTION_FAILED: {exc}") from exc
+                        result = {"ok": False, "error": str(exc)}
+                        error_text = str(exc)
+                        replace_content_errors = (
+                            error_text.startswith("replace text was not found:")
+                            or error_text.startswith(
+                                "replace text must match exactly once;"
+                            )
+                            or error_text.startswith("replace count ")
+                        )
+                        write_content_errors = (
+                            error_text.startswith("read existing file before rewriting:")
+                            or error_text.startswith("file changed since it was read:")
+                        )
+                        edit_type = action.get("action")
+                        if (
+                            (edit_type == "replace" and replace_content_errors)
+                            or (edit_type == "write" and write_content_errors)
+                        ) and isinstance(action.get("path"), str):
+                            try:
+                                repair_path, _ = agent._resolve(
+                                    action["path"], readable=True, must_exist=True
+                                )
+                            except AgentError:
+                                repair_path = None
+                            if repair_path is not None:
+                                pending_repair_read_path = repair_path
+                                progress_guard.allow_new_evidence()
+                                result["repair_directive"] = (
+                                    "Read the current contents at this exact path "
+                                    "before choosing a new edit. Do not repeat the "
+                                    "rejected edit."
+                                )
+                        if (
+                            require_edit
+                            and action.get("action") in {"replace", "write"}
+                        ):
+                            if exact_writable_files is not None:
+                                valid_targets = ", ".join(
+                                    sorted(exact_writable_files)
+                                )
+                                target_guidance = (
+                                    "Choose one of these exact writable file paths: "
+                                    f"{valid_targets}."
+                                )
+                            else:
+                                target_guidance = (
+                                    "Choose a path inside these writable scopes: "
+                                    + ", ".join(sorted(writable_paths))
+                                    + "."
+                                )
+                            result["repair_directive"] = (
+                                "The attempted edit was rejected and changed no file. "
+                                f"{target_guidance} Do not repeat the rejected path or "
+                                "edit a test or read-only dependency."
+                            )
+                    else:
+                        protocol_error_streak = 0
+                        _diagnostic(
+                            task_id,
+                            sandbox_name,
+                            current_stage,
+                            "ok",
+                            model_call=model_calls,
+                            action_type=action.get("action"),
+                        )
+
+                if (
+                    pending_repair_read_path is not None
+                    and action.get("action") == "read"
+                    and action.get("path") == pending_repair_read_path
+                    and result.get("ok") is True
+                ):
+                    pending_repair_read_path = None
+
+                mutation_occurred = (
+                    agent.mutation_generation != mutation_generation_before
+                )
+                if mutation_occurred:
+                    validation_state.mark_mutation(agent.mutation_generation)
+                    if validation_policy.commands:
+                        post_edit_validation_runs += 1
+
+                        def report_post_edit_validation(
+                            index: int, validation_result: ValidationResult
+                        ) -> None:
+                            _diagnostic(
+                                task_id,
+                                sandbox_name,
+                                "POST_EDIT_VALIDATION_COMMAND",
+                                "ok" if validation_result.passed else "error",
+                                model_call=model_calls,
+                                validation_command_index=index,
+                                returncode=validation_result.returncode,
+                                mutation_generation=agent.mutation_generation,
+                            )
+
+                        post_edit_results = validation_runner.run(
+                            on_result=report_post_edit_validation
+                        )
+                        post_edit_passed = validation_state.finish_post_edit_check(
+                            post_edit_results,
+                            agent.mutation_generation,
+                        )
+                        failed_post_edit_result = next(
+                            (
+                                validation_result
+                                for validation_result in post_edit_results
+                                if not validation_result.passed
+                            ),
+                            None,
+                        )
+                        if post_edit_passed and failed_post_edit_result is None:
+                            result["post_edit_validation"] = {
+                                "ok": True,
+                                "action": "post_edit_validation",
+                                "commands": [
+                                    validation_result.command
+                                    for validation_result in post_edit_results
+                                ],
+                                "mutation_generation": agent.mutation_generation,
+                            }
+                            _diagnostic(
+                                task_id,
+                                sandbox_name,
+                                "POST_EDIT_VALIDATION",
+                                "ok",
+                                model_call=model_calls,
+                                validation_commands=len(post_edit_results),
+                                mutation_generation=agent.mutation_generation,
+                            )
+                        else:
+                            if failed_post_edit_result is None:
+                                raise RuntimeError(
+                                    "post-edit validation returned no results"
+                                )
+                            post_edit_validation_failures += 1
+                            failure_feedback = failed_post_edit_result.feedback(
+                                validation_round=post_edit_validation_runs
+                            )
+                            failure_feedback["action"] = "post_edit_validation"
+                            failure_feedback["repair_directive"] = (
+                                "Inspect this exact compiler or test failure, return "
+                                "to the implicated in-scope implementation or test "
+                                "dependency, verify its declared API, and make a "
+                                "targeted repair before rerunning validation."
+                            )
+                            result["post_edit_validation"] = failure_feedback
+                            _diagnostic(
+                                task_id,
+                                sandbox_name,
+                                "POST_EDIT_VALIDATION",
+                                "error",
+                                model_call=model_calls,
+                                validation_commands=len(post_edit_results),
+                                returncode=failed_post_edit_result.returncode,
+                                mutation_generation=agent.mutation_generation,
+                            )
+                elif (
+                    validation_state.repair_required
+                    and action.get("action") == "run"
+                    and result.get("ok") is True
+                ):
+                    try:
+                        command_argv = _parse_command(action.get("command"))
+                    except AgentError:
+                        command_argv = ()
+                    if command_argv in validation_policy.commands:
+                        validation_state.mark_required_validation_passed()
+
+                repeat_count = progress_guard.observe(
+                    action,
+                    result,
+                    mutation_occurred=mutation_occurred,
+                )
+                if repeat_count > 1:
+                    result["progress_warning"] = (
+                        "This identical action returned the same result before. "
+                        "Reuse the retained result and choose different evidence, "
+                        "make a code change, or run a corrective test."
+                    )
+                    _diagnostic(
+                        task_id,
+                        sandbox_name,
+                        "ACTION_PROGRESS",
+                        "warning",
                         model_call=model_calls,
                         action_type=action.get("action"),
+                        repeat_count=repeat_count,
+                        repeated_actions=progress_guard.repeated_actions,
+                        discovery_actions=progress_guard.discovery_actions,
                     )
-
-                if agent.mutation_generation != mutation_generation_before:
-                    validation_state.mark_mutation(agent.mutation_generation)
+                if progress_guard.discovery_actions == DISCOVERY_PROGRESS_WARNING_AT:
+                    warning = (
+                        f"You have used {progress_guard.discovery_actions} "
+                        "read/grep or failed run actions without a code change "
+                        "or passing command. Stop broad discovery and use the "
+                        "next actions for the smallest relevant edit and check."
+                    )
+                    previous_warning = result.get("progress_warning")
+                    result["progress_warning"] = (
+                        f"{previous_warning} {warning}"
+                        if isinstance(previous_warning, str)
+                        else warning
+                    )
+                    _diagnostic(
+                        task_id,
+                        sandbox_name,
+                        "ACTION_PROGRESS",
+                        "warning",
+                        model_call=model_calls,
+                        kind="discovery_budget",
+                        discovery_actions=progress_guard.discovery_actions,
+                    )
+                if (
+                    action.get("action") == "done"
+                    and validation_state.repair_required
+                    and repeat_count >= 2
+                ):
+                    raise RuntimeError(
+                        "AGENT_DONE_WITHOUT_REPAIR: model repeated done after "
+                        "required host validation failed"
+                    )
 
                 current_stage = "ACTION_EXECUTE"
                 _diagnostic(
@@ -2861,6 +4635,10 @@ async def run_qwen_agent(
                     "ok" if result.get("ok") is True else "error",
                     model_call=model_calls,
                     action_type=result.get("action", action.get("action")),
+                    **_action_trace_metadata(action, result),
+                    read_bytes=agent.read_bytes,
+                    write_bytes=agent.write_bytes,
+                    mutation_generation=agent.mutation_generation,
                 )
                 if result.get("action") == "done" and result.get("ok") is True:
                     validation_state.mark_model_done()
@@ -2883,12 +4661,18 @@ async def run_qwen_agent(
                             validated=False,
                             actions=action_number,
                             model_calls=model_calls,
-                            completion_tokens=completion_tokens,
+                            **token_metrics(),
                             reasoning_chars=reasoning_chars,
                             read_bytes=agent.read_bytes,
                             write_bytes=agent.write_bytes,
                             validation_commands=0,
                             validation_rounds=0,
+                            repeated_actions=progress_guard.repeated_actions,
+                            discovery_actions=progress_guard.discovery_actions,
+                            protocol_errors=protocol_errors,
+                            post_edit_validation_runs=post_edit_validation_runs,
+                            post_edit_validation_failures=post_edit_validation_failures,
+                            rollback_count=agent.rollback_count,
                             elapsed_ms=_elapsed_ms(started),
                         )
                         return AgentResult(
@@ -2896,7 +4680,6 @@ async def run_qwen_agent(
                             actions=action_number,
                             files_changed=sorted(agent.changed_paths),
                             model_calls=model_calls,
-                            completion_tokens=completion_tokens,
                             reasoning_chars=reasoning_chars,
                             elapsed_ms=_elapsed_ms(started),
                             read_bytes=agent.read_bytes,
@@ -2905,11 +4688,19 @@ async def run_qwen_agent(
                             validation_commands=0,
                             validation_failures=0,
                             validation_rounds=0,
+                            **token_metrics(),
+                            model=model,
+                            repeated_actions=progress_guard.repeated_actions,
+                            discovery_actions=progress_guard.discovery_actions,
+                            protocol_errors=protocol_errors,
+                            post_edit_validation_runs=post_edit_validation_runs,
+                            post_edit_validation_failures=post_edit_validation_failures,
+                            rollback_count=agent.rollback_count,
                         )
 
                     current_stage = "VALIDATION_START"
                     validation_round = validation_state.start_round(
-                        MAX_VALIDATION_ROUNDS
+                        validation_round_limit
                     )
                     _diagnostic(
                         task_id,
@@ -2956,13 +4747,19 @@ async def run_qwen_agent(
                             validated=True,
                             actions=action_number,
                             model_calls=model_calls,
-                            completion_tokens=completion_tokens,
+                            **token_metrics(),
                             reasoning_chars=reasoning_chars,
                             read_bytes=agent.read_bytes,
                             write_bytes=agent.write_bytes,
                             validation_commands=validation_policy.count,
-                            validation_failures=validation_state.failure_count,
+                            validation_failures=validation_state.failures_total,
                             validation_rounds=validation_state.validation_rounds,
+                            repeated_actions=progress_guard.repeated_actions,
+                            discovery_actions=progress_guard.discovery_actions,
+                            protocol_errors=protocol_errors,
+                            post_edit_validation_runs=post_edit_validation_runs,
+                            post_edit_validation_failures=post_edit_validation_failures,
+                            rollback_count=agent.rollback_count,
                             elapsed_ms=_elapsed_ms(started),
                         )
                         return AgentResult(
@@ -2970,15 +4767,22 @@ async def run_qwen_agent(
                             actions=action_number,
                             files_changed=sorted(agent.changed_paths),
                             model_calls=model_calls,
-                            completion_tokens=completion_tokens,
                             reasoning_chars=reasoning_chars,
                             elapsed_ms=_elapsed_ms(started),
                             read_bytes=agent.read_bytes,
                             write_bytes=agent.write_bytes,
                             validated=True,
                             validation_commands=validation_policy.count,
-                            validation_failures=validation_state.failure_count,
+                            validation_failures=validation_state.failures_total,
                             validation_rounds=validation_state.validation_rounds,
+                            **token_metrics(),
+                            model=model,
+                            repeated_actions=progress_guard.repeated_actions,
+                            discovery_actions=progress_guard.discovery_actions,
+                            protocol_errors=protocol_errors,
+                            post_edit_validation_runs=post_edit_validation_runs,
+                            post_edit_validation_failures=post_edit_validation_failures,
+                            rollback_count=agent.rollback_count,
                         )
 
                     failed_result = next(
@@ -2999,11 +4803,13 @@ async def run_qwen_agent(
                         + 1,
                         returncode=failed_result.returncode,
                     )
-                    if validation_state.validation_rounds >= MAX_VALIDATION_ROUNDS:
+                    if validation_state.validation_rounds >= validation_round_limit:
                         raise RuntimeError(
-                            f"AGENT_VALIDATION_LIMIT: {MAX_VALIDATION_ROUNDS}"
+                            f"AGENT_VALIDATION_LIMIT: {validation_round_limit}"
                         )
                     feedback = failed_result.feedback(validation_round)
+                    if repeat_count > 1:
+                        feedback["progress_warning"] = result["progress_warning"]
                     conversation.record(
                         generation.text,
                         {"action": "validation"},
@@ -3043,6 +4849,17 @@ async def run_qwen_agent(
                 )
         raise RuntimeError(f"AGENT_ACTION_LIMIT: {max_actions}")
     except Exception as exc:
+        failed_generation_token_cap: int | None = None
+        if isinstance(exc, RuntimeError):
+            generation_failure = re.search(
+                r"\battempts=(\d+) generation_token_cap=(\d+) "
+                r"prefill_memory_retries=(\d+)",
+                str(exc),
+            )
+            if generation_failure is not None:
+                generation_request_attempts += int(generation_failure.group(1))
+                failed_generation_token_cap = int(generation_failure.group(2))
+                prefill_memory_retries += int(generation_failure.group(3))
         kind = _error_kind(exc, stage=current_stage)
         _diagnostic(
             task_id,
@@ -3059,10 +4876,17 @@ async def run_qwen_agent(
             failed_stage=current_stage,
             kind=kind,
             model_calls=model_calls,
-            completion_tokens=completion_tokens,
+            **token_metrics(),
+            generation_token_cap=failed_generation_token_cap,
             reasoning_chars=reasoning_chars,
             read_bytes=agent.read_bytes if agent is not None else 0,
             write_bytes=agent.write_bytes if agent is not None else 0,
+            repeated_actions=progress_guard.repeated_actions,
+            discovery_actions=progress_guard.discovery_actions,
+            protocol_errors=protocol_errors,
+            post_edit_validation_runs=post_edit_validation_runs,
+            post_edit_validation_failures=post_edit_validation_failures,
+            rollback_count=agent.rollback_count if agent is not None else 0,
             elapsed_ms=_elapsed_ms(started),
         )
         raise
