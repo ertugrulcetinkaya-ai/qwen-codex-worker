@@ -144,8 +144,10 @@ def _claim_profile_sandbox(profile: str, sandbox: Any) -> None:
     except OSError:
         raise ValueError("profile sandbox must resolve to an existing directory") from None
     birth_time = getattr(metadata, "st_birthtime_ns", None)
-    if birth_time is None and hasattr(metadata, "st_birthtime"):
-        birth_time = int(metadata.st_birthtime * 1_000_000_000)
+    if birth_time is None:
+        st_birthtime = getattr(metadata, "st_birthtime", None)
+        if st_birthtime is not None:
+            birth_time = int(st_birthtime * 1_000_000_000)
     if metadata.st_ino and birth_time is not None:
         identity = f"{metadata.st_dev}:{metadata.st_ino}:{birth_time}"
     else:
