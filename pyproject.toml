@@ -33,7 +33,9 @@ python_version = "3.11"
 files = [
     "qwen_agent.py",
     "qwen_agent_cli.py",
+    "qwen_agent_profiles.py",
     "qwen_input_limits.py",
+    "qwen_omlx_auth.py",
     "qwen_patch_cli.py",
     "qwen_worker_server.py",
 ]

@@ -10,7 +10,7 @@ import logging
 import sys
 from typing import Any
 
-from qwen_agent import run_qwen_agent
+from qwen_agent_profiles import run_qwen_agent_profile
 from qwen_input_limits import (
     MAX_ALLOW_SCOPES,
     MAX_ALLOWED_COMMANDS,
@@ -25,6 +25,8 @@ from qwen_input_limits import (
     MAX_VALIDATION_COMMANDS,
     MAX_VALIDATION_FAILURE_BYTES,
     MAX_VALIDATION_FAILURE_CHARS,
+    MAX_VALIDATION_OUTPUT_PATHS,
+    MAX_VALIDATION_READ_PATHS,
     InputLimitError,
     ensure_request_budget,
     read_bounded,
@@ -36,6 +38,10 @@ from qwen_input_limits import (
 
 class RequestError(ValueError):
     """An invalid qwen-agent invocation or request document."""
+
+
+DEFAULT_PROFILE = "non-thinking"
+PROFILE_CHOICES = ("non-thinking", "thinking")
 
 
 def _read_request_bytes(arguments: list[str]) -> bytes:
@@ -140,8 +146,12 @@ def _parse_json_request(raw: bytes) -> dict[str, Any]:
         "read_only",
         "allowed_commands",
         "validation_commands",
+        "validation_read_paths",
+        "validation_output_paths",
         "validation_failure",
         "max_actions",
+        "profile",
+        "resume",
     }
     unknown = sorted(set(request) - allowed)
     if unknown:
@@ -196,6 +206,22 @@ def _parse_json_request(raw: bytes) -> dict[str, Any]:
                 MAX_COMMAND_BYTES,
                 MAX_COMMAND_CHARS,
             ),
+            (
+                "validation_output_paths",
+                MAX_VALIDATION_OUTPUT_PATHS,
+                "TOO_MANY_VALIDATION_OUTPUT_PATHS",
+                "path",
+                MAX_PATH_BYTES,
+                MAX_PATH_CHARS,
+            ),
+            (
+                "validation_read_paths",
+                MAX_VALIDATION_READ_PATHS,
+                "TOO_MANY_VALIDATION_READ_PATHS",
+                "path",
+                MAX_PATH_BYTES,
+                MAX_PATH_CHARS,
+            ),
         ):
             if field in request:
                 request[field] = validate_string_list(
@@ -228,6 +254,12 @@ def _parse_json_request(raw: bytes) -> dict[str, Any]:
         or not isinstance(request["max_actions"], int)
     ):
         raise RequestError("max_actions must be an integer")
+    if "profile" in request and request["profile"] not in PROFILE_CHOICES:
+        raise RequestError("unknown profile")
+    if "resume" in request and not isinstance(request["resume"], bool):
+        raise RequestError("resume must be a boolean")
+    request.setdefault("profile", DEFAULT_PROFILE)
+    request.setdefault("resume", False)
     return request
 
 
@@ -241,11 +273,23 @@ def _flag_parser() -> argparse.ArgumentParser:
     parser.add_argument("--read-only", action="append", default=[])
     parser.add_argument("--allow-command", action="append", default=[])
     parser.add_argument("--validation-command", action="append", default=[])
+    parser.add_argument("--validation-read-path", action="append", default=[])
+    parser.add_argument("--validation-output-path", action="append", default=[])
     task_group = parser.add_mutually_exclusive_group(required=True)
     task_group.add_argument("--task")
     task_group.add_argument("--task-file")
     parser.add_argument("--validation-failure")
     parser.add_argument("--max-actions", type=int, default=30)
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="revalidate and continue an existing sandbox task",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=list(PROFILE_CHOICES),
+        default=DEFAULT_PROFILE,
+    )
     return parser
 
 
@@ -257,6 +301,14 @@ def _precheck_flag_arguments(arguments: list[str]) -> None:
         "--validation-command": (
             MAX_VALIDATION_COMMANDS,
             "TOO_MANY_VALIDATION_COMMANDS",
+        ),
+        "--validation-output-path": (
+            MAX_VALIDATION_OUTPUT_PATHS,
+            "TOO_MANY_VALIDATION_OUTPUT_PATHS",
+        ),
+        "--validation-read-path": (
+            MAX_VALIDATION_READ_PATHS,
+            "TOO_MANY_VALIDATION_READ_PATHS",
         ),
     }
     counts = {flag: 0 for flag in limits}
@@ -322,6 +374,24 @@ def _request_from_flags(arguments: list[str]) -> dict[str, Any]:
             max_bytes=MAX_COMMAND_BYTES,
             max_chars=MAX_COMMAND_CHARS,
         )
+        validation_output_paths = validate_string_list(
+            parsed.validation_output_path,
+            field="validation_output_paths",
+            max_items=MAX_VALIDATION_OUTPUT_PATHS,
+            count_code="TOO_MANY_VALIDATION_OUTPUT_PATHS",
+            item_kind="path",
+            max_bytes=MAX_PATH_BYTES,
+            max_chars=MAX_PATH_CHARS,
+        )
+        validation_read_paths = validate_string_list(
+            parsed.validation_read_path,
+            field="validation_read_paths",
+            max_items=MAX_VALIDATION_READ_PATHS,
+            count_code="TOO_MANY_VALIDATION_READ_PATHS",
+            item_kind="path",
+            max_bytes=MAX_PATH_BYTES,
+            max_chars=MAX_PATH_CHARS,
+        )
         validation_failure = (
             validate_text(
                 parsed.validation_failure,
@@ -344,8 +414,12 @@ def _request_from_flags(arguments: list[str]) -> dict[str, Any]:
         "read_only": read_only,
         "allowed_commands": allowed_commands,
         "validation_commands": validation_commands,
+        "validation_read_paths": validation_read_paths,
+        "validation_output_paths": validation_output_paths,
         "validation_failure": validation_failure,
         "max_actions": parsed.max_actions,
+        "profile": parsed.profile,
+        "resume": parsed.resume,
     }
     try:
         return ensure_request_budget(request)
@@ -361,17 +435,20 @@ def _load_request(arguments: list[str]) -> dict[str, Any]:
 
 async def _run(arguments: list[str]) -> dict[str, Any]:
     request = _load_request(arguments)
-    result = await run_qwen_agent(
+    return await run_qwen_agent_profile(
+        profile=request["profile"],
         task=request["task"],
         sandbox=request["sandbox"],
         allow=request["allow"],
         read_only=request.get("read_only"),
         allowed_commands=request.get("allowed_commands"),
         validation_commands=request.get("validation_commands"),
+        validation_read_paths=request.get("validation_read_paths"),
+        validation_output_paths=request.get("validation_output_paths"),
         validation_failure=request.get("validation_failure"),
         max_actions=request.get("max_actions", 30),
+        resume=request.get("resume", False),
     )
-    return result.as_dict()
 
 
 def main(arguments: list[str] | None = None) -> int:

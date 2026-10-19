@@ -29,6 +29,7 @@ QWEN_PATCH = PROJECT_ROOT / "qwen-patch"
 class _QwenHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.server.get_count += 1
+        self.server.last_authorization = self.headers.get("Authorization")
         body = json.dumps({"data": [{"id": self.server.model}]}).encode("utf-8")
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
@@ -38,6 +39,7 @@ class _QwenHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         self.server.post_count += 1
+        self.server.last_authorization = self.headers.get("Authorization")
         length = int(self.headers["Content-Length"])
         self.server.last_request = json.loads(self.rfile.read(length))
         if self.server.response_status == 200:
@@ -89,6 +91,7 @@ class MockQwenServer:
         self.server.final_text = final_text
         self.server.model = model
         self.server.last_request = None
+        self.server.last_authorization = None
         self.server.get_count = 0
         self.server.post_count = 0
         self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
@@ -135,6 +138,11 @@ class CliIntegrationTests(unittest.TestCase):
         self.repo_root = Path(self.temporary_directory.name)
         self.source = self.repo_root / "example.txt"
         self.source.write_text("alpha\n", encoding="utf-8")
+        self.omlx_settings = self.repo_root / "omlx-settings.json"
+        self.omlx_settings.write_text(
+            json.dumps({"auth": {"api_key": "unit-test-key"}}), encoding="utf-8"
+        )
+        os.chmod(self.omlx_settings, 0o600)
 
     def tearDown(self):
         self.temporary_directory.cleanup()
@@ -150,6 +158,7 @@ class CliIntegrationTests(unittest.TestCase):
         self, request_bytes=None, arguments=(), base_url=None, environment_overrides=None
     ):
         environment = os.environ.copy()
+        environment["QWEN_OMLX_SETTINGS_PATH"] = str(self.omlx_settings)
         if base_url is not None:
             environment["QWEN_BASE_URL"] = base_url
         environment.update(environment_overrides or {})
@@ -178,6 +187,7 @@ class CliIntegrationTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.source.stat().st_mode), original_mode)
         self.assertEqual(qwen.server.get_count, 1)
         self.assertEqual(qwen.server.post_count, 1)
+        self.assertEqual(qwen.server.last_authorization, "Bearer unit-test-key")
         self.assertEqual(qwen.server.last_request["model"], DEFAULT_MODEL)
         self.assertIs(qwen.server.last_request["stream"], True)
         prompt = qwen.server.last_request["messages"][1]["content"]
@@ -274,6 +284,7 @@ class CliIntegrationTests(unittest.TestCase):
         diff = "--- example.txt\n+++ example.txt\n@@ -1 +1 @@\n-alpha\n+beta\n"
         environment = os.environ.copy()
         environment["QWEN_DEBUG"] = "1"
+        environment["QWEN_OMLX_SETTINGS_PATH"] = str(self.omlx_settings)
         with MockQwenServer(diff) as qwen:
             environment["QWEN_BASE_URL"] = qwen.base_url
             result = subprocess.run(
@@ -286,7 +297,11 @@ class CliIntegrationTests(unittest.TestCase):
                 check=False,
             )
 
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=result.stderr.decode("utf-8", errors="replace"),
+        )
         self.assertEqual(result.stdout, diff.encode("utf-8"))
         diagnostic = result.stderr.decode()
         self.assertIn("finish_reason='stop'", diagnostic)

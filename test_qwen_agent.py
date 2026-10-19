@@ -44,12 +44,12 @@ from qwen_worker_server import (
 )
 
 
-def _sse_response(*events, status=200):
+def _sse_response(*events, status=200, headers=None):
     body = "".join(f"data: {json.dumps(event)}\n\n" for event in events)
     body += "data: [DONE]\n\n"
     return httpx.Response(
         status,
-        headers={"content-type": "text/event-stream"},
+        headers={"content-type": "text/event-stream", **(headers or {})},
         content=body.encode("utf-8"),
     )
 
@@ -87,6 +87,50 @@ class SandboxActionTests(unittest.TestCase):
         result = agent.execute({"action": "read", "path": "example.txt"})
         self.assertEqual(result["content"], "hello world\n")
         self.assertEqual(result["path"], "example.txt")
+
+    def test_read_bounded_range_from_large_text_file(self):
+        lines = [f"line-{index}" for index in range(1, 20_001)]
+        self.source.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        agent = SandboxAgent(self.root, ["example.txt"])
+
+        with self.assertRaisesRegex(AgentError, "file exceeds read limit"):
+            agent.execute({"action": "read", "path": "example.txt"})
+        result = agent.execute(
+            {
+                "action": "read",
+                "path": "example.txt",
+                "start_line": 15_000,
+                "end_line": 15_002,
+            }
+        )
+
+        self.assertEqual(result["content"], "\n".join(lines[14_999:15_002]))
+        self.assertNotIn("example.txt", agent.fully_observed_files)
+        self.assertGreater(agent.read_bytes, qwen_agent.MAX_READ_BYTES)
+
+    def test_read_keeps_source_under_byte_limit_complete(self):
+        source_text = "x" * (qwen_agent.MAX_READ_CHARS - 1)
+        self.source.write_text(source_text, encoding="utf-8")
+        agent = SandboxAgent(self.root, ["example.txt"])
+
+        result = agent.execute({"action": "read", "path": "example.txt"})
+
+        self.assertEqual(result["content"], source_text)
+        self.assertNotIn("[truncated]", result["content"])
+        self.assertIn("example.txt", agent.fully_observed_files)
+
+    def test_read_uses_character_limit_and_keeps_multibyte_text_complete(self):
+        source_text = "م" * 21_000
+        self.assertLess(len(source_text.encode("utf-8")), qwen_agent.MAX_READ_BYTES)
+        self.assertLess(len(source_text), qwen_agent.MAX_READ_CHARS)
+        self.source.write_text(source_text, encoding="utf-8")
+        agent = SandboxAgent(self.root, ["example.txt"])
+
+        result = agent.execute({"action": "read", "path": "example.txt"})
+
+        self.assertEqual(result["content"], source_text)
+        self.assertNotIn("[truncated]", result["content"])
+        self.assertIn("example.txt", agent.fully_observed_files)
 
     def test_grep_does_not_authorize_full_write(self):
         agent = SandboxAgent(self.root, ["example.txt"])
@@ -492,7 +536,43 @@ class SandboxActionTests(unittest.TestCase):
             [self.root.resolve() / "example.txt"],
         )
         self.assertFalse(model_policy.validation)
+        self.assertEqual(
+            [scope.path for scope in validation_policy.readable_paths],
+            [
+                self.root.resolve() / "example.txt",
+                self.root.resolve() / "context.txt",
+            ],
+        )
         self.assertEqual(validation_policy.writable_paths, ())
+        self.assertTrue(validation_policy.validation)
+
+    def test_validation_paths_are_separate_from_model_file_scopes(self):
+        generated = self.root / "build-output"
+        generated.mkdir()
+        validation_source = self.root / "validation-source"
+        validation_source.mkdir()
+        agent = SandboxAgent(
+            self.root,
+            ["example.txt"],
+            validation_read_paths=["validation-source"],
+            validation_output_paths=["build-output"],
+        )
+
+        model_policy = agent._command_access_policy(Path("/tmp"), validation=False)
+        validation_policy = agent._command_access_policy(Path("/tmp"), validation=True)
+
+        self.assertEqual(
+            [scope.path for scope in model_policy.readable_paths],
+            [self.root.resolve() / "example.txt"],
+        )
+        self.assertEqual(
+            [scope.path for scope in validation_policy.readable_paths],
+            [validation_source.resolve()],
+        )
+        self.assertEqual(
+            [scope.path for scope in validation_policy.writable_paths],
+            [generated.resolve()],
+        )
         self.assertTrue(validation_policy.validation)
 
     def test_command_profile_denies_forbidden_components_without_root_authority(self):
@@ -562,6 +642,216 @@ class SandboxActionTests(unittest.TestCase):
         )
         self.assertFalse(captured["access_policy"].validation)
         self.assertFalse(captured["access_policy"].scratch_path.exists())
+
+    def test_failed_model_command_rolls_back_writable_changes(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        (generated / "changed.txt").write_text("before\n", encoding="utf-8")
+        (generated / "deleted.txt").write_text("restore\n", encoding="utf-8")
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(self.root, ["generated"], allowed_commands=[command])
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                (generated / "changed.txt").write_text("partial\n", encoding="utf-8")
+                (generated / "created.txt").write_text("remove\n", encoding="utf-8")
+                (generated / "deleted.txt").unlink()
+                return qwen_agent.CommandResult(1, "failed", "command error")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertFalse(result["ok"])
+        self.assertCountEqual(
+            result["rolled_back_paths"],
+            [
+                "generated/changed.txt",
+                "generated/created.txt",
+                "generated/deleted.txt",
+            ],
+        )
+        self.assertEqual((generated / "changed.txt").read_text(), "before\n")
+        self.assertFalse((generated / "created.txt").exists())
+        self.assertEqual((generated / "deleted.txt").read_text(), "restore\n")
+        self.assertEqual(agent.changed_paths, set())
+        self.assertEqual(agent.mutation_generation, 0)
+        self.assertEqual(agent.rollback_count, 3)
+
+    def test_failed_command_symlink_swap_cannot_write_outside_writable_scope(self):
+        command = f"{shlex.quote(sys.executable)} --version"
+        for target_kind in ("outside", "private"):
+            with self.subTest(target_kind=target_kind):
+                generated = self.root / f"generated-{target_kind}"
+                nested = generated / "nested"
+                nested.mkdir(parents=True)
+                (nested / "victim.txt").write_text("before snapshot\n")
+
+                if target_kind == "outside":
+                    outside_directory = tempfile.TemporaryDirectory(
+                        prefix="qwen-rollback-outside-"
+                    )
+                    self.addCleanup(outside_directory.cleanup)
+                    target = Path(outside_directory.name)
+                else:
+                    target = self.root / "private"
+                    target.mkdir()
+                (target / "victim.txt").write_text("protected sentinel\n")
+
+                agent = SandboxAgent(
+                    self.root, [generated.name], allowed_commands=[command]
+                )
+
+                class FakeSandbox:
+                    def run(self, _argv, **_kwargs):
+                        shutil.rmtree(nested)
+                        nested.symlink_to(target, target_is_directory=True)
+                        return qwen_agent.CommandResult(1, "failed", "injected")
+
+                with mock.patch(
+                    "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+                ):
+                    result = agent.execute({"action": "run", "command": command})
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    (target / "victim.txt").read_text(encoding="utf-8"),
+                    "protected sentinel\n",
+                )
+                self.assertTrue(nested.is_dir())
+                self.assertFalse(nested.is_symlink())
+                self.assertEqual(
+                    (nested / "victim.txt").read_text(encoding="utf-8"),
+                    "before snapshot\n",
+                )
+                self.assertEqual(agent.changed_paths, set())
+
+    def test_failed_command_with_symlinked_file_scope_parent_fails_closed(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        private = self.root / "private"
+        private.mkdir()
+        protected = private / "new.txt"
+        protected.write_text("protected sentinel\n", encoding="utf-8")
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["generated/new.txt"], allowed_commands=[command]
+        )
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                generated.rmdir()
+                generated.symlink_to(private, target_is_directory=True)
+                return qwen_agent.CommandResult(1, "failed", "injected")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            with self.assertRaisesRegex(
+                AgentError, "could not be safely tracked or rolled back"
+            ):
+                agent.execute({"action": "run", "command": command})
+
+        self.assertEqual(protected.read_text(encoding="utf-8"), "protected sentinel\n")
+        self.assertTrue(generated.is_symlink())
+
+    def test_failed_command_restores_symlink_object_without_following_target(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        outside_directory = tempfile.TemporaryDirectory(
+            prefix="qwen-rollback-link-target-"
+        )
+        self.addCleanup(outside_directory.cleanup)
+        target = Path(outside_directory.name) / "target.txt"
+        target.write_text("protected sentinel\n", encoding="utf-8")
+        link = generated / "link.txt"
+        link.symlink_to(target)
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(self.root, ["generated"], allowed_commands=[command])
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                link.unlink()
+                link.write_text("temporary replacement\n", encoding="utf-8")
+                return qwen_agent.CommandResult(1, "failed", "injected")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.readlink(), target)
+        self.assertEqual(target.read_text(encoding="utf-8"), "protected sentinel\n")
+
+    def test_failed_command_restores_file_changes_in_read_only_nested_directory(self):
+        generated = self.root / "generated"
+        nested = generated / "nested"
+        nested.mkdir(parents=True)
+        tracked = nested / "tracked.txt"
+        tracked.write_text("before\n", encoding="utf-8")
+        nested.chmod(0o555)
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(self.root, ["generated"], allowed_commands=[command])
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                nested.chmod(0o755)
+                tracked.write_text("partial\n", encoding="utf-8")
+                (nested / "created.txt").write_text("created\n", encoding="utf-8")
+                nested.chmod(0o555)
+                return qwen_agent.CommandResult(1, "failed", "injected")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(tracked.read_text(encoding="utf-8"), "before\n")
+        self.assertFalse((nested / "created.txt").exists())
+        self.assertEqual(nested.stat().st_mode & 0o777, 0o555)
+
+    def test_snapshot_rejects_directory_symlink_swap_between_check_and_open(self):
+        generated = self.root / "generated"
+        nested = generated / "nested"
+        nested.mkdir(parents=True)
+        (nested / "tracked.txt").write_text("inside\n", encoding="utf-8")
+        outside_directory = tempfile.TemporaryDirectory(
+            prefix="qwen-rollback-race-target-"
+        )
+        self.addCleanup(outside_directory.cleanup)
+        outside = Path(outside_directory.name)
+        protected = outside / "protected.txt"
+        protected.write_text("protected sentinel\n", encoding="utf-8")
+        agent = SandboxAgent(self.root, ["generated"])
+        root_fd = agent._open_command_root_fd()
+        original_open_directory = agent._open_verified_command_directory
+        swapped = False
+
+        def swap_before_open(parent_fd, name, observed):
+            nonlocal swapped
+            if name == "nested" and not swapped:
+                nested.rename(generated / "nested-moved")
+                nested.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_open_directory(parent_fd, name, observed)
+
+        try:
+            with mock.patch.object(
+                agent,
+                "_open_verified_command_directory",
+                side_effect=swap_before_open,
+            ):
+                with self.assertRaisesRegex(AgentError, "changed during safe inspection"):
+                    agent._snapshot_writable_state(root_fd)
+        finally:
+            os.close(root_fd)
+
+        self.assertTrue(swapped)
+        self.assertEqual(protected.read_text(encoding="utf-8"), "protected sentinel\n")
 
     def test_model_command_without_mutation_keeps_generation(self):
         command = f"{shlex.quote(sys.executable)} --version"
@@ -854,6 +1144,43 @@ class SandboxActionTests(unittest.TestCase):
         self.assertEqual(result["truncation_reason"], "file_skip")
         self.assertEqual(result["skipped_reasons"]["file_too_large"], 1)
 
+    def test_grep_searches_large_text_file_with_bounded_result(self):
+        source_directory = self.root / "src"
+        source_directory.mkdir()
+        content = b"x" * (qwen_agent.MAX_READ_BYTES * 2) + b"\nneedle at end\n"
+        self.assertGreater(len(content), qwen_agent.MAX_READ_BYTES)
+        self.assertLessEqual(len(content), qwen_agent.MAX_GREP_FILE_BYTES)
+        (source_directory / "large.json").write_bytes(content)
+        agent = SandboxAgent(self.root, ["src"])
+
+        result = agent.execute(
+            {"action": "grep", "query": "needle", "paths": ["src"]}
+        )
+
+        self.assertEqual(result["matches"], ["src/large.json:2:needle at end"])
+        self.assertEqual(result["files_scanned"], 1)
+        self.assertFalse(result["truncated"])
+        self.assertEqual(result["truncation_reason"], None)
+
+    def test_grep_enforces_total_file_byte_budget(self):
+        source_directory = self.root / "src"
+        source_directory.mkdir()
+        (source_directory / "a.txt").write_bytes(b"needle\n" + b"a" * 53)
+        (source_directory / "b.txt").write_bytes(b"needle\n" + b"b" * 53)
+        agent = SandboxAgent(self.root, ["src"])
+
+        with mock.patch.object(qwen_agent, "MAX_GREP_TOTAL_BYTES", 64):
+            result = agent.execute(
+                {"action": "grep", "query": "needle", "paths": ["src"]}
+            )
+
+        self.assertEqual(result["matches"], ["src/a.txt:1:needle"])
+        self.assertEqual(result["files_scanned"], 1)
+        self.assertEqual(result["files_skipped"], 1)
+        self.assertTrue(result["truncated"])
+        self.assertEqual(result["truncation_reason"], "byte_limit")
+        self.assertEqual(result["skipped_reasons"]["total_byte_limit"], 1)
+
     def test_full_observation_survives_conversation_compaction(self):
         agent = SandboxAgent(self.root, ["example.txt"])
         agent.execute({"action": "read", "path": "example.txt"})
@@ -908,7 +1235,14 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         return f"{shlex.quote(sys.executable)} -c {shlex.quote(bootstrap)}"
 
     def _run_python(
-        self, code: str, *, allow=None, read_only=None, validation=False
+        self,
+        code: str,
+        *,
+        allow=None,
+        read_only=None,
+        validation=False,
+        validation_read_paths=None,
+        validation_output_paths=None,
     ):
         command = self._python_command(code)
         agent = SandboxAgent(
@@ -916,10 +1250,33 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
             allow or ["input.txt"],
             read_only=read_only or [],
             allowed_commands=[command],
+            validation_read_paths=validation_read_paths or [],
+            validation_output_paths=validation_output_paths or [],
         )
         if validation:
             return agent.run_validation_command(qwen_agent._parse_command(command)), agent
         return agent.execute({"action": "run", "command": command}), agent
+
+    def test_validation_writes_only_declared_generated_directory(self):
+        generated = self.root / "build-output"
+        generated.mkdir()
+        result, _agent = self._run_python(
+            "from pathlib import Path; Path('build-output/result.txt').write_text('built')",
+            validation=True,
+            validation_read_paths=["input.txt"],
+            validation_output_paths=["build-output"],
+        )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual((generated / "result.txt").read_text(), "built")
+
+        denied, _agent = self._run_python(
+            "from pathlib import Path; Path('input.txt').write_text('changed')",
+            validation=True,
+            validation_read_paths=["input.txt"],
+            validation_output_paths=["build-output"],
+        )
+        self.assertFalse(denied["ok"])
+        self.assertEqual(self.input_path.read_text(), "inside sentinel\n")
 
     def test_outside_file_read_is_denied_without_secret_output(self):
         outside = self.root.parent / f"{self.root.name}-outside-secret.txt"
@@ -958,6 +1315,61 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertNotIn("TOP_SECRET_SYMLINK_SENTINEL", result["stdout"])
         self.assertNotIn("TOP_SECRET_SYMLINK_SENTINEL", result["stderr"])
+
+    def test_failed_command_symlink_swap_rollback_stays_inside_writable_scope(self):
+        generated = self.root / "generated"
+        nested = generated / "nested"
+        nested.mkdir(parents=True)
+        (nested / "victim.txt").write_text("before snapshot\n", encoding="utf-8")
+        outside = self.root.parent / f"{self.root.name}-rollback-outside"
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "victim.txt").write_text("protected sentinel\n", encoding="utf-8")
+
+        code = (
+            "import os, shutil, sys; "
+            "shutil.rmtree('generated/nested'); "
+            f"os.symlink({str(outside)!r}, 'generated/nested', target_is_directory=True); "
+            "print('SYMLINK_CREATED', flush=True); sys.exit(23)"
+        )
+        result, _agent = self._run_python(code, allow=["generated"])
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("SYMLINK_CREATED", result["stdout"])
+        self.assertEqual(
+            (outside / "victim.txt").read_text(encoding="utf-8"),
+            "protected sentinel\n",
+        )
+        self.assertTrue(nested.is_dir())
+        self.assertFalse(nested.is_symlink())
+        self.assertEqual(
+            (nested / "victim.txt").read_text(encoding="utf-8"),
+            "before snapshot\n",
+        )
+
+    def test_failed_command_cannot_move_writable_scope_outside_sandbox(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        (generated / "nested").mkdir()
+        private = self.root / "private"
+        private.mkdir()
+        destination = private / "generated"
+
+        code = (
+            "import os, sys\n"
+            "try:\n"
+            "    os.rename('generated', 'private/generated')\n"
+            "except OSError as exc:\n"
+            "    print('RENAME_DENIED', type(exc).__name__, flush=True)\n"
+            "    sys.exit(23)\n"
+            "print('RENAME_ALLOWED', flush=True)\n"
+        )
+        result, _agent = self._run_python(code, allow=["generated"])
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("RENAME_DENIED", result["stdout"])
+        self.assertTrue(generated.is_dir())
+        self.assertFalse(destination.exists())
 
     def test_out_of_scope_sandbox_read_is_denied_without_secret_output(self):
         private = self.root / "private.txt"
@@ -1159,6 +1571,88 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["stdout"], "inside sentinel\n")
 
+        developer_directory = qwen_agent._active_developer_directory()
+        self.assertIsNotNone(developer_directory)
+        assert developer_directory is not None
+        xcode_select = "/usr/bin/xcode-select -p"
+        toolchain_listing = shlex.join(
+            ["/bin/ls", "-ld", str(developer_directory)]
+        )
+        agent = SandboxAgent(
+            self.root,
+            ["input.txt"],
+            allowed_commands=[xcode_select, toolchain_listing],
+        )
+
+        model_xcode_result = agent.execute(
+            {"action": "run", "command": xcode_select}
+        )
+        self.assertFalse(model_xcode_result["ok"])
+        model_toolchain_result = agent.execute(
+            {"action": "run", "command": toolchain_listing}
+        )
+        self.assertFalse(model_toolchain_result["ok"])
+
+        validation_xcode_result = agent.run_validation_command(
+            qwen_agent._parse_command(xcode_select)
+        )
+        self.assertEqual(validation_xcode_result["returncode"], 0)
+        self.assertEqual(
+            validation_xcode_result["stdout"].strip(),
+            str(developer_directory),
+        )
+        validation_toolchain_result = agent.run_validation_command(
+            qwen_agent._parse_command(toolchain_listing)
+        )
+        self.assertEqual(validation_toolchain_result["returncode"], 0)
+        self.assertIn(
+            str(developer_directory), validation_toolchain_result["stdout"]
+        )
+
+    def test_flutter_sdk_cache_is_available_only_to_host_validation(self):
+        with tempfile.TemporaryDirectory(prefix="flutter-sdk-fixture-") as sdk_dir:
+            sdk_root = Path(sdk_dir) / "flutter"
+            binary_directory = sdk_root / "bin"
+            cache_directory = binary_directory / "cache"
+            cache_directory.mkdir(parents=True)
+            flutter = binary_directory / "flutter"
+            flutter.write_text(
+                "#!/bin/sh\n"
+                'SDK_BIN=${0%/*}\n'
+                'printf "ready\\n" > "$SDK_BIN/cache/engine.stamp"\n'
+                "exit 0\n",
+                encoding="utf-8",
+            )
+            flutter.chmod(0o755)
+            stamp = cache_directory / "engine.stamp"
+            command = shlex.join([str(flutter), "validate"])
+            agent = SandboxAgent(
+                self.root,
+                ["input.txt"],
+                allowed_commands=[command],
+                validation_read_paths=["input.txt"],
+            )
+
+            model_result = agent.execute(
+                {"action": "run", "command": command}
+            )
+            self.assertFalse(model_result["ok"])
+            self.assertEqual(model_result["returncode"], 1)
+            self.assertIn(
+                "Flutter SDK cache access was denied",
+                model_result["stderr"],
+            )
+            self.assertFalse(stamp.exists())
+
+            validation_result = agent.run_validation_command(
+                qwen_agent._parse_command(command)
+            )
+            self.assertEqual(validation_result["returncode"], 0, validation_result)
+            self.assertEqual(stamp.read_text(encoding="utf-8"), "ready\n")
+            self.assertEqual(
+                self.input_path.read_text(encoding="utf-8"), "inside sentinel\n"
+            )
+
     def test_command_scratch_is_writable_without_project_mutation(self):
         result, agent = self._run_python(
             "import os; from pathlib import Path; "
@@ -1253,6 +1747,24 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
 
 
 class AgentProtocolTests(unittest.TestCase):
+    def test_action_trace_metadata_is_hashed_and_content_free(self):
+        metadata = qwen_agent._action_trace_metadata(
+            {"action": "read", "path": "private/source.py"},
+            {
+                "ok": True,
+                "action": "read",
+                "path": "private/source.py",
+                "content": "SOURCE_CONTENT_SENTINEL",
+            },
+        )
+        self.assertEqual(len(metadata["action_sha256"]), 16)
+        self.assertEqual(len(metadata["target_sha256"]), 16)
+        self.assertEqual(len(metadata["result_sha256"]), 16)
+        self.assertEqual(metadata["path"], "private/source.py")
+        self.assertEqual(metadata["result_ok"], True)
+        self.assertIsNone(metadata["returncode"])
+        self.assertNotIn("SOURCE_CONTENT_SENTINEL", str(metadata))
+
     def test_invalid_json_action_is_rejected(self):
         with self.assertRaisesRegex(AgentError, "valid JSON"):
             parse_action("not json")
@@ -1276,9 +1788,14 @@ class AgentProtocolTests(unittest.TestCase):
             agent.root.rmdir()
 
     def test_response_format_requires_action_specific_fields(self):
-        schema = qwen_agent.AGENT_RESPONSE_FORMAT["schema"]
+        self.assertEqual(qwen_agent.AGENT_RESPONSE_FORMAT["type"], "json_schema")
+        self.assertEqual(
+            qwen_agent.AGENT_RESPONSE_FORMAT["json_schema"]["name"],
+            "qwen_worker_action",
+        )
+        schema = qwen_agent.AGENT_RESPONSE_FORMAT["json_schema"]["schema"]
         alternatives = schema["oneOf"]
-        self.assertEqual(len(alternatives), 5)
+        self.assertEqual(len(alternatives), 6)
         self.assertNotIn("$ref", json.dumps(schema))
         self.assertNotIn("$defs", json.dumps(schema))
 
@@ -1287,12 +1804,222 @@ class AgentProtocolTests(unittest.TestCase):
             "grep": ["action", "query"],
             "replace": ["action", "path", "old", "new"],
             "write": ["action", "path", "content"],
+            "run": ["action", "command"],
             "done": ["action", "summary"],
         }
+        action_names = []
         for alternative in alternatives:
             action = alternative["properties"]["action"]["enum"][0]
+            action_names.append(action)
             self.assertEqual(alternative["required"], expected_required[action])
             self.assertFalse(alternative["additionalProperties"])
+        self.assertEqual(set(action_names), set(expected_required))
+        self.assertIn('{"action":"run","command":"one explicitly allowed command"}', qwen_agent.AGENT_SYSTEM_PROMPT)
+
+    def test_edit_response_format_only_allows_mutating_actions(self):
+        self.assertEqual(qwen_agent.EDIT_RESPONSE_FORMAT["type"], "json_schema")
+        allowed = [
+            alternative["properties"]["action"]["enum"][0]
+            for alternative in qwen_agent.EDIT_RESPONSE_FORMAT["json_schema"]["schema"]["oneOf"]
+        ]
+        self.assertEqual(allowed, ["replace", "write"])
+
+    def test_edit_response_format_constrains_exact_file_scopes(self):
+        response_format = qwen_agent._edit_response_format_for_paths(
+            ["src/worker.py", "src/runtime.py"]
+        )
+        paths = [
+            alternative["properties"]["path"]["enum"]
+            for alternative in response_format["json_schema"]["schema"]["oneOf"]
+        ]
+        self.assertEqual(paths, [["src/runtime.py", "src/worker.py"]] * 2)
+        self.assertNotIn(
+            "enum",
+            qwen_agent.EDIT_RESPONSE_FORMAT["json_schema"]["schema"]["oneOf"][0][
+                "properties"
+            ]["path"],
+        )
+        directory_format = qwen_agent._edit_response_format_for_paths(None)
+        self.assertNotIn(
+            "enum",
+            directory_format["json_schema"]["schema"]["oneOf"][0]["properties"][
+                "path"
+            ],
+        )
+        repair_format = qwen_agent._edit_response_format_for_paths(
+            ["src/worker.py", "src/runtime.py"],
+            repair_read_path="src/runtime.py",
+        )
+        repair_actions = {
+            alternative["properties"]["action"]["enum"][0]: alternative
+            for alternative in repair_format["json_schema"]["schema"]["oneOf"]
+        }
+        self.assertEqual(set(repair_actions), {"read"})
+        self.assertEqual(
+            repair_actions["read"]["properties"]["path"]["enum"],
+            ["src/runtime.py"],
+        )
+
+    def test_action_progress_guard_blocks_exact_edit_that_failed_validation(self):
+        guard = qwen_agent.ActionProgressGuard()
+        action = {
+            "action": "write",
+            "path": "src/runtime.py",
+            "content": "incorrect implementation\n",
+        }
+        result = {
+            "ok": True,
+            "action": "write",
+            "post_edit_validation": {"ok": False, "stderr": "compile error"},
+        }
+
+        self.assertEqual(
+            guard.observe(action, result, mutation_occurred=True), 0
+        )
+        self.assertTrue(guard.failure_pending)
+        self.assertTrue(guard.is_previously_failed_edit(action))
+        self.assertFalse(
+            guard.is_previously_failed_edit(
+                {**action, "content": "corrected implementation\n"}
+            )
+        )
+
+    def test_action_progress_guard_warns_then_stops_stagnant_repeats(self):
+        guard = qwen_agent.ActionProgressGuard()
+        action = {"action": "grep", "query": "TODO", "paths": ["src"]}
+        result = {"ok": True, "action": "grep", "matches": []}
+
+        self.assertEqual(
+            guard.observe(action, result, mutation_occurred=False), 1
+        )
+        self.assertEqual(
+            guard.observe(action, result, mutation_occurred=False), 2
+        )
+        self.assertEqual(
+            guard.observe(action, result, mutation_occurred=False), 3
+        )
+        with self.assertRaisesRegex(RuntimeError, "AGENT_REPEATED_ACTION_LIMIT"):
+            guard.observe(action, result, mutation_occurred=False)
+        self.assertEqual(guard.repeated_actions, 3)
+        self.assertEqual(
+            guard.observe(action, result, mutation_occurred=True), 0
+        )
+
+    def test_action_progress_guard_treats_done_summaries_as_same_action(self):
+        guard = qwen_agent.ActionProgressGuard()
+        result = {
+            "ok": False,
+            "action": "done",
+            "error": "validation_repair_required",
+        }
+        self.assertEqual(
+            guard.observe(
+                {"action": "done", "summary": "first"},
+                result,
+                mutation_occurred=False,
+            ),
+            1,
+        )
+        self.assertEqual(
+            guard.observe(
+                {"action": "done", "summary": "different wording"},
+                result,
+                mutation_occurred=False,
+            ),
+            2,
+        )
+
+    def test_action_progress_guard_treats_noisy_failed_run_as_same_attempt(self):
+        guard = qwen_agent.ActionProgressGuard()
+        action = {
+            "action": "run",
+            "command": "python3 -m unittest test_example",
+        }
+        self.assertEqual(
+            guard.observe(
+                action,
+                {
+                    "ok": False,
+                    "returncode": 1,
+                    "stdout": "Ran 1 test in 0.01s",
+                    "stderr": "FAILED (failures=1)",
+                },
+                mutation_occurred=False,
+            ),
+            1,
+        )
+        self.assertEqual(
+            guard.observe(
+                action,
+                {
+                    "ok": False,
+                    "returncode": 1,
+                    "stdout": "Ran 1 test in 0.02s",
+                    "stderr": "FAILED (failures=1)",
+                },
+                mutation_occurred=False,
+            ),
+            2,
+        )
+
+    def test_action_progress_guard_bounds_discovery_until_pass_or_mutation(self):
+        guard = qwen_agent.ActionProgressGuard()
+        for index in range(qwen_agent.MAX_DISCOVERY_ACTIONS_WITHOUT_PROGRESS):
+            self.assertEqual(
+                guard.observe(
+                    {"action": "grep", "query": f"term-{index}"},
+                    {"ok": True, "matches": []},
+                    mutation_occurred=False,
+                ),
+                1,
+            )
+        self.assertEqual(
+            guard.discovery_actions,
+            qwen_agent.MAX_DISCOVERY_ACTIONS_WITHOUT_PROGRESS,
+        )
+        with self.assertRaisesRegex(RuntimeError, "AGENT_DISCOVERY_LIMIT"):
+            guard.observe(
+                {"action": "read", "path": "src/example.py"},
+                {"ok": True, "content": ""},
+                mutation_occurred=False,
+            )
+        with self.assertRaisesRegex(RuntimeError, "AGENT_DISCOVERY_LIMIT"):
+            guard.observe(
+                {"action": "run", "command": "python -m unittest"},
+                {"ok": False, "returncode": 1},
+                mutation_occurred=False,
+            )
+        self.assertEqual(
+            guard.observe(
+                {"action": "run", "command": "python -m unittest"},
+                {"ok": True, "returncode": 0},
+                mutation_occurred=False,
+            ),
+            1,
+        )
+        self.assertEqual(guard.discovery_actions, 0)
+
+    def test_parse_action_accepts_run_and_rejects_schema_mismatches(self):
+        action = parse_action(
+            '{"action":"run","command":"python -m unittest -q"}'
+        )
+        self.assertEqual(
+            action,
+            {"action": "run", "command": "python -m unittest -q"},
+        )
+        for raw, message in (
+            ('{"action":"run"}', "missing required field"),
+            (
+                '{"action":"run","command":"git status","extra":true}',
+                "unsupported field",
+            ),
+            (
+                '{"action":"read","path":"file.py","start_line":true}',
+                "start_line must be integer",
+            ),
+        ):
+            with self.subTest(raw=raw), self.assertRaisesRegex(AgentError, message):
+                parse_action(raw)
 
     def test_stdout_status_contains_no_unified_diff(self):
         result = qwen_agent.AgentResult(
@@ -1306,7 +2033,12 @@ class AgentProtocolTests(unittest.TestCase):
             read_bytes=12,
             write_bytes=11,
         )
-        with mock.patch.object(qwen_agent_cli, "run_qwen_agent", return_value=result):
+        with mock.patch.object(
+            qwen_agent_cli,
+            "run_qwen_agent_profile",
+            new_callable=mock.AsyncMock,
+            return_value=result.as_dict(),
+        ):
             output = io.StringIO()
             with contextlib.redirect_stdout(output):
                 self.assertEqual(
@@ -1380,6 +2112,29 @@ class AgentConversationTests(unittest.TestCase):
         )
         self.assertIn("CURRENT_READ_SENTINEL", messages[-1]["content"])
 
+        self.record(
+            conversation,
+            read_action,
+            read_result,
+            files_read=("example.txt",),
+            actions_completed=2,
+        )
+        messages, stats = conversation.snapshot()
+        duplicate_read = json.loads(messages[-1]["content"])
+        self.assertTrue(duplicate_read["content_reused"])
+        self.assertIn("refer to that content", duplicate_read["content"])
+        self.assertNotIn("CURRENT_READ_SENTINEL", messages[-1]["content"])
+        self.assertEqual(stats["deduplicated_reads"], 1)
+        self.assertEqual(
+            sum(
+                item["content"].count("CURRENT_READ_SENTINEL")
+                for item in messages
+                if item["role"] == "user"
+                and item["content"].startswith("{")
+            ),
+            1,
+        )
+
         replace_action = {
             "action": "replace",
             "path": "example.txt",
@@ -1399,7 +2154,7 @@ class AgentConversationTests(unittest.TestCase):
             replace_result,
             files_read=("example.txt",),
             files_changed=("example.txt",),
-            actions_completed=2,
+            actions_completed=3,
         )
         messages, _stats = conversation.snapshot()
         self.assertIn("CURRENT_READ_SENTINEL", "\n".join(item["content"] for item in messages))
@@ -1432,6 +2187,140 @@ class AgentConversationTests(unittest.TestCase):
         self.assertGreater(stats["history_dropped_interactions"], 0)
         self.assertLessEqual(sizes[-1], MAX_AGENT_HISTORY_CHARS)
 
+    def test_large_complete_read_survives_compaction_and_is_invalidated_by_edit(self):
+        conversation = self.make_conversation()
+        source = "PINNED_SOURCE_SENTINEL\n" + ("x" * 35_000)
+        self.record(
+            conversation,
+            {"action": "read", "path": "src/large.py"},
+            {
+                "ok": True,
+                "action": "read",
+                "path": "src/large.py",
+                "content": source,
+            },
+            files_read=("src/large.py",),
+        )
+        for index in range(MAX_AGENT_RECENT_INTERACTIONS + 2):
+            self.record(
+                conversation,
+                {"action": "read", "path": "tests/test_large.py"},
+                {
+                    "ok": True,
+                    "action": "read",
+                    "path": "tests/test_large.py",
+                    "content": f"later-read-{index}",
+                },
+                files_read=("src/large.py", "tests/test_large.py"),
+                actions_completed=index + 2,
+            )
+
+        messages, stats = conversation.snapshot()
+        rendered = "\n".join(item["content"] for item in messages)
+        self.assertIn("PINNED COMPLETE READ", rendered)
+        self.assertIn("PINNED_SOURCE_SENTINEL", rendered)
+        self.assertEqual(stats["pinned_read_chars"], len(source))
+        self.assertTrue(stats["history_compacted"])
+        self.assertLessEqual(stats["history_chars"], MAX_AGENT_HISTORY_CHARS)
+
+        self.record(
+            conversation,
+            {"action": "read", "path": "src/large.py"},
+            {
+                "ok": True,
+                "action": "read",
+                "path": "src/large.py",
+                "content": source,
+            },
+            files_read=("src/large.py",),
+            actions_completed=MAX_AGENT_RECENT_INTERACTIONS + 3,
+        )
+        self.assertEqual(conversation._deduplicated_reads, 1)
+
+        self.record(
+            conversation,
+            {"action": "replace", "path": "src/large.py", "old": "x", "new": "y"},
+            {"ok": True, "action": "replace", "path": "src/large.py", "replaced": 1},
+            files_changed=("src/large.py",),
+        )
+        messages, stats = conversation.snapshot()
+        rendered = "\n".join(item["content"] for item in messages)
+        self.assertNotIn("PINNED_SOURCE_SENTINEL", rendered)
+        self.assertEqual(stats["pinned_read_chars"], 0)
+
+    def test_multiple_complete_reads_survive_compaction_until_each_file_changes(self):
+        conversation = self.make_conversation()
+        source_reads = {
+            "test/runtime_test.dart": "PINNED_TEST_SENTINEL\n" + ("t" * 21_400),
+            "lib/runtime.dart": "PINNED_RUNTIME_SENTINEL\n" + ("r" * 12_500),
+            "lib/settings.dart": "PINNED_SETTINGS_SENTINEL\n" + ("s" * 12_000),
+        }
+        for index, (path, content) in enumerate(source_reads.items(), start=1):
+            self.record(
+                conversation,
+                {"action": "read", "path": path},
+                {
+                    "ok": True,
+                    "action": "read",
+                    "path": path,
+                    "content": content,
+                },
+                files_read=source_reads,
+                actions_completed=index,
+            )
+        for index in range(MAX_AGENT_RECENT_INTERACTIONS + 2):
+            self.record(
+                conversation,
+                {"action": "read", "path": "test/other_test.dart"},
+                {
+                    "ok": True,
+                    "action": "read",
+                    "path": "test/other_test.dart",
+                    "content": f"filler-{index}",
+                },
+                files_read=source_reads,
+                actions_completed=index + len(source_reads) + 1,
+            )
+
+        messages, stats = conversation.snapshot()
+        rendered = "\n".join(item["content"] for item in messages)
+        for content in source_reads.values():
+            self.assertIn(content.splitlines()[0], rendered)
+        self.assertEqual(
+            stats["pinned_read_chars"],
+            sum(len(content) for content in source_reads.values()),
+        )
+        self.assertTrue(stats["history_compacted"])
+        self.assertLessEqual(stats["history_chars"], MAX_AGENT_HISTORY_CHARS)
+
+        path, content = next(iter(source_reads.items()))
+        self.record(
+            conversation,
+            {"action": "read", "path": path},
+            {"ok": True, "action": "read", "path": path, "content": content},
+            files_read=source_reads,
+            actions_completed=20,
+        )
+        self.assertEqual(conversation._deduplicated_reads, 1)
+
+        self.record(
+            conversation,
+            {"action": "replace", "path": path, "old": "old", "new": "new"},
+            {"ok": True, "action": "replace", "path": path, "replaced": 1},
+            files_read=source_reads,
+            files_changed=(path,),
+            actions_completed=21,
+        )
+        messages, stats = conversation.snapshot()
+        rendered = "\n".join(item["content"] for item in messages)
+        self.assertNotIn(content.splitlines()[0], rendered)
+        for other_path, other_content in list(source_reads.items())[1:]:
+            self.assertIn(other_content.splitlines()[0], rendered)
+        self.assertEqual(
+            stats["pinned_read_chars"],
+            sum(len(value) for key, value in source_reads.items() if key != path),
+        )
+
     def test_old_read_content_is_replaced_by_file_metadata(self):
         conversation = self.make_conversation()
         for index in range(MAX_AGENT_RECENT_INTERACTIONS + 1):
@@ -1457,6 +2346,23 @@ class AgentConversationTests(unittest.TestCase):
         self.assertIn("fully_observed_files", rendered)
         self.assertIn("example.txt", rendered)
 
+        self.record(
+            conversation,
+            {"action": "read", "path": "example.txt"},
+            {
+                "ok": True,
+                "action": "read",
+                "path": "example.txt",
+                "content": "current-6",
+            },
+            files_read=("example.txt",),
+            actions_completed=MAX_AGENT_RECENT_INTERACTIONS + 2,
+        )
+        messages, _stats = conversation.snapshot()
+        self.assertEqual(
+            json.loads(messages[-1]["content"])["content"], "current-6"
+        )
+
     def test_old_command_output_is_replaced_by_status_metadata(self):
         conversation = self.make_conversation()
         self.record(
@@ -1467,8 +2373,11 @@ class AgentConversationTests(unittest.TestCase):
                 "action": "run",
                 "command": "pytest tests/test_example.py",
                 "returncode": 1,
-                "stdout": "OLD_COMMAND_OUTPUT_SENTINEL",
-                "stderr": "failure",
+                "stdout": (
+                    "OLD_COMMAND_OUTPUT_SENTINEL\n"
+                    "lib/example.dart:7: Error: The getter 'missing' isn't defined."
+                ),
+                "stderr": "compilation failed",
             },
         )
         for index in range(MAX_AGENT_RECENT_INTERACTIONS):
@@ -1487,8 +2396,50 @@ class AgentConversationTests(unittest.TestCase):
         messages, _stats = conversation.snapshot()
         rendered = "\n".join(item["content"] for item in messages)
         self.assertNotIn("OLD_COMMAND_OUTPUT_SENTINEL", rendered)
+        self.assertIn("The getter 'missing' isn't defined", rendered)
         self.assertIn("last_command=run", rendered)
         self.assertIn("returncode=1", rendered)
+
+    def test_post_edit_validation_failure_survives_context_compaction(self):
+        conversation = self.make_conversation()
+        for index in range(MAX_AGENT_RECENT_INTERACTIONS + 1):
+            self.record(
+                conversation,
+                {"action": "read", "path": "src/example.py"},
+                {
+                    "ok": True,
+                    "action": "read",
+                    "path": "src/example.py",
+                    "content": f"read-{index}",
+                },
+                files_read=("src/example.py",),
+                actions_completed=index + 1,
+            )
+        self.record(
+            conversation,
+            {"action": "replace", "path": "src/example.py"},
+            {
+                "ok": True,
+                "action": "replace",
+                "path": "src/example.py",
+                "post_edit_validation": {
+                    "ok": False,
+                    "action": "post_edit_validation",
+                    "command": "dart analyze",
+                    "returncode": 1,
+                    "stderr": "lib/example.dart:9: Error: The getter 'missing' isn't defined.",
+                },
+            },
+            files_changed=("src/example.py",),
+        )
+
+        messages, stats = conversation.snapshot()
+        rendered = "\n".join(item["content"] for item in messages)
+        self.assertTrue(stats["history_compacted"])
+        self.assertIn("last_validation_failure", rendered)
+        self.assertIn("The getter 'missing' isn't defined", rendered)
+        self.assertIn("last_edit_summary:", rendered)
+        self.assertIn("replace path=src/example.py", rendered)
 
     def test_old_grep_matches_are_replaced_by_metadata(self):
         conversation = self.make_conversation()
@@ -1630,6 +2581,23 @@ class AgentValidationConversationTests(unittest.TestCase):
         self.assertEqual(state.phase, ValidationPhase.EDITING)
         self.assertIsNone(state.validated_generation)
 
+    def test_failed_validation_requires_repair_evidence(self):
+        state = qwen_agent.ValidationState()
+        failed = ValidationResult("git diff", 1, "failure", "")
+        self.assertFalse(state.finish_round((failed,), 0))
+        self.assertTrue(state.repair_required)
+        state.prepare_retry()
+        self.assertTrue(state.repair_required)
+        state.mark_mutation(1)
+        self.assertFalse(state.repair_required)
+        self.assertEqual(state.phase, ValidationPhase.EDITING)
+
+    def test_required_validation_pass_clears_repair_requirement(self):
+        state = qwen_agent.ValidationState()
+        state.finish_round((ValidationResult("git diff", 1, "", ""),), 0)
+        state.mark_required_validation_passed()
+        self.assertFalse(state.repair_required)
+
     def test_old_validation_output_is_compacted_but_metadata_survives(self):
         conversation = AgentConversation(
             "repair the task",
@@ -1668,7 +2636,32 @@ class AgentValidationConversationTests(unittest.TestCase):
         self.assertIn("validation", rendered)
         self.assertIn("returncode=1", rendered)
 
+    def test_compact_state_tracks_remaining_action_budget(self):
+        conversation = AgentConversation(
+            "implement the requested change",
+            ["example.txt"],
+            (),
+            (),
+            None,
+            max_actions=8,
+        )
+        conversation.record(
+            json.dumps({"action": "grep", "query": "target", "paths": ["src"]}),
+            {"action": "grep", "query": "target", "paths": ["src"]},
+            {"ok": True, "action": "grep", "matches": []},
+            files_read=(),
+            files_changed=(),
+            actions_completed=3,
+            protocol_errors=0,
+        )
 
+        messages, _stats = conversation.snapshot()
+        state = messages[2]["content"]
+        self.assertIn("action_limit=8", state)
+        self.assertIn("actions_remaining=5", state)
+
+
+@mock.patch("qwen_agent._omlx_api_headers", new=lambda: {})
 class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
     validation_command = "git diff"
 
@@ -1713,14 +2706,24 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
         validation_commands=None,
         max_actions=10,
         capture_messages=None,
+        capture_edit_modes=None,
+        capture_edit_paths=None,
+        capture_repair_read_paths=None,
+        resume=False,
     ):
         generations = list(actions)
         fake_sandbox = self.FakeCommandSandbox(outcomes)
         self.last_fake_sandbox = fake_sandbox
 
-        async def fake_turn(_client, _base, _model, messages):
+        async def fake_turn(_client, _base, _model, messages, **kwargs):
             if capture_messages is not None:
                 capture_messages.append(messages)
+            if capture_edit_modes is not None:
+                capture_edit_modes.append(kwargs.get("require_edit", False))
+            if capture_edit_paths is not None:
+                capture_edit_paths.append(kwargs.get("editable_file_paths"))
+            if capture_repair_read_paths is not None:
+                capture_repair_read_paths.append(kwargs.get("repair_read_path"))
             action = generations.pop(0) if generations else {
                 "action": "done",
                 "summary": "finished",
@@ -1746,6 +2749,7 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
                     allowed_commands=allowed_commands,
                     validation_commands=validation_commands,
                     max_actions=max_actions,
+                    resume=resume,
                 )
         return result, fake_sandbox
 
@@ -1776,6 +2780,103 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(fake_sandbox.calls), 1)
         self.assertTrue(fake_sandbox.calls[0][1]["access_policy"].validation)
 
+    async def test_host_validation_infrastructure_failure_is_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "example.txt").write_text("unchanged\n", encoding="utf-8")
+            agent = SandboxAgent(
+                directory,
+                ["example.txt"],
+                allowed_commands=[self.validation_command],
+            )
+            policy = qwen_agent.ValidationPolicy.from_commands(
+                [self.validation_command], agent.allowed_commands
+            )
+            runner = qwen_agent.ValidationRunner(agent, policy)
+            with mock.patch(
+                "qwen_agent._discover_command_sandbox",
+                side_effect=AgentError("command sandbox is unavailable"),
+            ):
+                infrastructure_result = runner.run()
+
+            self.assertEqual(infrastructure_result[0].returncode, 127)
+            self.assertFalse(infrastructure_result[0].passed)
+            self.assertIn(
+                "validation command execution failed",
+                infrastructure_result[0].stderr,
+            )
+
+            state = qwen_agent.ValidationState()
+            state.start_round(1)
+            self.assertFalse(
+                state.finish_round(infrastructure_result, agent.mutation_generation)
+            )
+            self.assertIsNone(state.validated_generation)
+
+            ordinary_failure_sandbox = self.FakeCommandSandbox(
+                [(1, "test assertion failed", "")]
+            )
+            with mock.patch(
+                "qwen_agent._discover_command_sandbox",
+                return_value=ordinary_failure_sandbox,
+            ):
+                test_failure = runner.run()
+            self.assertEqual(test_failure[0].returncode, 1)
+            self.assertFalse(test_failure[0].passed)
+
+    async def test_resume_returns_validated_without_model_call_when_tests_pass(self):
+        result, fake_sandbox = await self.invoke(
+            [{"action": "done", "summary": "must not be requested"}],
+            [(0, "existing sandbox passes", "")],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            resume=True,
+        )
+
+        self.assertEqual(result.status, "validated")
+        self.assertEqual(result.actions, 0)
+        self.assertEqual(result.model_calls, 0)
+        self.assertIsNone(result.prompt_tokens)
+        self.assertEqual(result.validation_rounds, 1)
+        self.assertEqual(len(fake_sandbox.calls), 1)
+
+    async def test_resume_failure_is_context_for_repair_and_counted(self):
+        messages = []
+        result, fake_sandbox = await self.invoke(
+            [
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "bad",
+                    "new": "good",
+                },
+                {"action": "done", "summary": "fixed"},
+            ],
+            [
+                (1, "resume failure output", "resume failed"),
+                (0, "post-edit pass", ""),
+                (0, "final pass", ""),
+            ],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            capture_messages=messages,
+            resume=True,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(result.validation_rounds, 2)
+        self.assertEqual(result.validation_failures, 1)
+        self.assertIn("RESUME_PREFLIGHT_FAILURES", messages[0][1]["content"])
+        self.assertIn("resume failure output", messages[0][1]["content"])
+        self.assertEqual(len(fake_sandbox.calls), 3)
+
+    async def test_resume_requires_host_validation(self):
+        with self.assertRaisesRegex(AgentError, "resume requires"):
+            await self.invoke(
+                [{"action": "done", "summary": "unused"}],
+                [],
+                resume=True,
+            )
+
     async def test_validation_failure_is_feedback_for_the_next_model_turn(self):
         messages = []
         with self.assertRaisesRegex(RuntimeError, "AGENT_ACTION_LIMIT"):
@@ -1797,6 +2898,73 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(feedback["returncode"], 1)
         self.assertIn("PRIVATE_VALIDATION_OUTPUT", feedback["stdout"])
 
+    async def test_failed_validation_rejects_done_until_code_is_repaired(self):
+        messages = []
+        result, fake_sandbox = await self.invoke(
+            [
+                {"action": "done", "summary": "first attempt"},
+                {"action": "done", "summary": "same state"},
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "bad",
+                    "new": "good",
+                },
+                {"action": "done", "summary": "repaired"},
+            ],
+            [
+                (1, "failure", ""),
+                (0, "post-edit pass", ""),
+                (0, "final pass", ""),
+            ],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            max_actions=4,
+            capture_messages=messages,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(result.model_calls, 4)
+        self.assertEqual(result.validation_rounds, 2)
+        self.assertEqual(result.validation_failures, 1)
+        self.assertEqual(len(fake_sandbox.calls), 3)
+        rejected_done = json.loads(messages[2][-1]["content"])
+        self.assertEqual(rejected_done["action"], "done")
+        self.assertIn("validation_repair_required", rejected_done["error"])
+
+    async def test_repeated_done_after_failed_validation_stops_early(self):
+        with self.assertRaisesRegex(RuntimeError, "AGENT_DONE_WITHOUT_REPAIR"):
+            await self.invoke(
+                [
+                    {"action": "done", "summary": "first"},
+                    {"action": "done", "summary": "second"},
+                    {"action": "done", "summary": "third"},
+                ],
+                [(1, "failure", "")],
+                allowed_commands=[self.validation_command],
+                validation_commands=[self.validation_command],
+                max_actions=5,
+            )
+        self.assertEqual(len(self.last_fake_sandbox.calls), 1)
+
+    async def test_successful_required_test_allows_done_after_failure(self):
+        result, fake_sandbox = await self.invoke(
+            [
+                {"action": "done", "summary": "first attempt"},
+                {"action": "run", "command": self.validation_command},
+                {"action": "done", "summary": "required test passed"},
+            ],
+            [(1, "host failure", ""), (0, "model pass", ""), (0, "host pass", "")],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            max_actions=3,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(result.validation_rounds, 2)
+        self.assertEqual(result.validation_failures, 1)
+        self.assertEqual(len(fake_sandbox.calls), 3)
+
     async def test_failure_fix_pass_completes_as_validated(self):
         result, fake_sandbox = await self.invoke(
             [
@@ -1815,7 +2983,11 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {"action": "done", "summary": "fixed"},
             ],
-            [(1, "first failure", ""), (0, "", "")],
+            [
+                (1, "first edit failure", ""),
+                (0, "repair pass", ""),
+                (0, "final pass", ""),
+            ],
             allowed_commands=[self.validation_command],
             validation_commands=[self.validation_command],
             max_actions=4,
@@ -1823,8 +2995,11 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result.status, "validated")
         self.assertTrue(result.validated)
-        self.assertEqual(result.validation_rounds, 2)
-        self.assertEqual(len(fake_sandbox.calls), 2)
+        self.assertEqual(result.validation_rounds, 1)
+        self.assertEqual(result.validation_failures, 1)
+        self.assertEqual(result.post_edit_validation_runs, 2)
+        self.assertEqual(result.post_edit_validation_failures, 1)
+        self.assertEqual(len(fake_sandbox.calls), 3)
 
     async def test_model_run_success_is_not_reused_after_mutation(self):
         result, fake_sandbox = await self.invoke(
@@ -1838,14 +3013,18 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {"action": "done", "summary": "finished"},
             ],
-            [(0, "model pass", ""), (0, "host pass", "")],
+            [
+                (0, "model pass", ""),
+                (0, "post-edit pass", ""),
+                (0, "host pass", ""),
+            ],
             allowed_commands=[self.validation_command],
             validation_commands=[self.validation_command],
             max_actions=3,
         )
 
         self.assertTrue(result.validated)
-        self.assertEqual(len(fake_sandbox.calls), 2)
+        self.assertEqual(len(fake_sandbox.calls), 3)
         self.assertEqual(fake_sandbox.calls[0][0][1], "diff")
         self.assertEqual(fake_sandbox.calls[1][0][1], "diff")
 
@@ -1860,13 +3039,241 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
                 },
                 {"action": "done", "summary": "finished"},
             ],
-            [(0, "", "")],
+            [(0, "post-edit pass", ""), (0, "final pass", "")],
             allowed_commands=[self.validation_command],
             validation_commands=[self.validation_command],
         )
 
         self.assertTrue(result.validated)
-        self.assertEqual(len(fake_sandbox.calls), 1)
+        self.assertEqual(len(fake_sandbox.calls), 2)
+
+    async def test_edit_validation_failure_is_repaired_before_done(self):
+        messages = []
+        result, fake_sandbox = await self.invoke(
+            [
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "bad",
+                    "new": "candidate",
+                },
+                {"action": "read", "path": "example.txt"},
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "candidate",
+                    "new": "good",
+                },
+                {"action": "done", "summary": "fixed and validated"},
+            ],
+            [
+                (1, "compile error: missing method", "compiler failed"),
+                (0, "post-edit pass", ""),
+                (0, "final pass", ""),
+            ],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            capture_messages=messages,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(result.post_edit_validation_runs, 2)
+        self.assertEqual(result.post_edit_validation_failures, 1)
+        self.assertEqual(result.validation_failures, 1)
+        self.assertEqual(len(fake_sandbox.calls), 3)
+        first_edit_feedback = json.loads(messages[1][-1]["content"])
+        self.assertIn("post_edit_validation", first_edit_feedback)
+        self.assertIn(
+            "compile error",
+            first_edit_feedback["post_edit_validation"]["stdout"],
+        )
+
+    async def test_failed_edit_validation_limits_discovery_before_repair(self):
+        edit_modes = []
+        edit_paths = []
+        result, fake_sandbox = await self.invoke(
+            [
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "bad",
+                    "new": "candidate",
+                },
+                {"action": "read", "path": "example.txt"},
+                {
+                    "action": "grep",
+                    "query": "candidate",
+                    "paths": ["example.txt"],
+                },
+                {"action": "read", "path": "example.txt"},
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "candidate",
+                    "new": "good",
+                },
+                {"action": "done", "summary": "repaired"},
+            ],
+            [
+                (1, "compile failure: wrong API", "compiler failed"),
+                (0, "repair passes", ""),
+                (0, "final pass", ""),
+            ],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            capture_edit_modes=edit_modes,
+            capture_edit_paths=edit_paths,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(edit_modes, [False, False, False, False, True, False])
+        self.assertEqual(
+            edit_paths,
+            [None, None, None, None, ["example.txt"], None],
+        )
+        self.assertEqual(result.post_edit_validation_runs, 2)
+        self.assertEqual(result.post_edit_validation_failures, 1)
+        self.assertEqual(len(fake_sandbox.calls), 3)
+
+    async def test_identical_edit_after_failed_validation_is_rejected(self):
+        repeated_edit = {
+            "action": "replace",
+            "path": "example.txt",
+            "old": "bad",
+            "new": "candidate",
+        }
+        messages = []
+        result, fake_sandbox = await self.invoke(
+            [
+                repeated_edit,
+                repeated_edit,
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "candidate",
+                    "new": "good",
+                },
+                {"action": "done", "summary": "fixed"},
+            ],
+            [
+                (1, "compile error: missing method", "compiler failed"),
+                (0, "repaired", ""),
+                (0, "final pass", ""),
+            ],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            capture_messages=messages,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(result.post_edit_validation_runs, 2)
+        self.assertEqual(result.post_edit_validation_failures, 1)
+        self.assertEqual(len(fake_sandbox.calls), 3)
+        repeated_action_feedback = json.loads(messages[2][-1]["content"])
+        self.assertIn("AGENT_IDENTICAL_FAILED_EDIT", repeated_action_feedback["error"])
+        self.assertIn("Do not repeat", repeated_action_feedback["repair_directive"])
+
+    async def test_missing_replace_text_forces_targeted_source_refresh(self):
+        repair_read_paths = []
+        messages = []
+        result, fake_sandbox = await self.invoke(
+            [
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "bad",
+                    "new": "candidate",
+                },
+                {"action": "read", "path": "example.txt"},
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "missing",
+                    "new": "wrong",
+                },
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "candidate",
+                    "new": "wrong",
+                },
+                {"action": "read", "path": "example.txt"},
+                {
+                    "action": "replace",
+                    "path": "example.txt",
+                    "old": "candidate",
+                    "new": "good",
+                },
+                {"action": "done", "summary": "repaired"},
+            ],
+            [
+                (1, "compile error: first edit", "compiler failed"),
+                (0, "repair passes", ""),
+                (0, "final pass", ""),
+            ],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            capture_messages=messages,
+            capture_repair_read_paths=repair_read_paths,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(repair_read_paths[3], "example.txt", repr(repair_read_paths))
+        self.assertEqual(repair_read_paths[4], "example.txt")
+        self.assertIn(
+            "must read exactly example.txt",
+            messages[4][-1]["content"],
+        )
+        self.assertEqual(result.post_edit_validation_runs, 2)
+        self.assertEqual(result.post_edit_validation_failures, 1)
+        self.assertEqual(len(fake_sandbox.calls), 3)
+
+    async def test_rejected_write_forces_exact_source_read_before_retry(self):
+        repair_read_paths = []
+        messages = []
+        result, fake_sandbox = await self.invoke(
+            [
+                {
+                    "action": "read",
+                    "path": "example.txt",
+                    "start_line": 1,
+                    "end_line": 1,
+                },
+                {
+                    "action": "write",
+                    "path": "example.txt",
+                    "content": "stale rewrite\n",
+                },
+                {
+                    "action": "write",
+                    "path": "example.txt",
+                    "content": "repeat rejected rewrite\n",
+                },
+                {"action": "read", "path": "example.txt"},
+                {
+                    "action": "write",
+                    "path": "example.txt",
+                    "content": "repaired\n",
+                },
+                {"action": "done", "summary": "repaired"},
+            ],
+            [(0, "post-edit validation passed", ""), (0, "final validation passed", "")],
+            allowed_commands=[self.validation_command],
+            validation_commands=[self.validation_command],
+            capture_messages=messages,
+            capture_repair_read_paths=repair_read_paths,
+        )
+
+        self.assertTrue(result.validated)
+        self.assertEqual(repair_read_paths[2], "example.txt")
+        self.assertEqual(repair_read_paths[3], "example.txt")
+        repair_feedback = "\n".join(
+            message["content"] for message in messages[3]
+        )
+        self.assertIn("AGENT_REPAIR_SOURCE_REFRESH_REQUIRED", repair_feedback)
+        self.assertIn("must read exactly example.txt", repair_feedback)
+        self.assertEqual(fake_sandbox.calls[-1][0][1], "diff")
+        self.assertEqual(len(fake_sandbox.calls), 2)
 
     async def test_required_validation_runs_after_model_selected_easy_test(self):
         result, fake_sandbox = await self.invoke(
@@ -1938,15 +3345,45 @@ class AgentValidationFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_validation_round_limit_is_bounded(self):
         with self.assertRaisesRegex(RuntimeError, "AGENT_VALIDATION_LIMIT"):
             await self.invoke(
-                [{"action": "done", "summary": "finished"}],
-                [(1, "failure", "")],
+                [
+                    {"action": "done", "summary": "first"},
+                    {
+                        "action": "replace",
+                        "path": "example.txt",
+                        "old": "bad",
+                        "new": "attempt one",
+                    },
+                    {"action": "done", "summary": "second"},
+                    {
+                        "action": "replace",
+                        "path": "example.txt",
+                        "old": "attempt one",
+                        "new": "attempt two",
+                    },
+                    {"action": "done", "summary": "third"},
+                    {
+                        "action": "replace",
+                        "path": "example.txt",
+                        "old": "attempt two",
+                        "new": "attempt three",
+                    },
+                    {"action": "done", "summary": "fourth"},
+                ],
+                [
+                    (1, "failure one", ""),
+                    (0, "edit pass one", ""),
+                    (1, "failure two", ""),
+                    (0, "edit pass two", ""),
+                    (1, "failure three", ""),
+                    (0, "edit pass three", ""),
+                ],
                 allowed_commands=[self.validation_command],
                 validation_commands=[self.validation_command],
                 max_actions=100,
             )
 
         self.assertEqual(
-            len(self.last_fake_sandbox.calls), MAX_VALIDATION_ROUNDS
+            len(self.last_fake_sandbox.calls), 2 * MAX_VALIDATION_ROUNDS - 1
         )
 
     async def test_validation_telemetry_contains_metadata_but_not_output(self):
@@ -1975,6 +3412,8 @@ class AgentValidationCliContractTests(unittest.TestCase):
             "allow": ["example.txt"],
             "allowed_commands": ["git diff"],
             "validation_commands": ["git diff"],
+            "validation_read_paths": ["src", "tests"],
+            "validation_output_paths": [".dart_tool", "build"],
         }
         request.update(updates)
         return request
@@ -1984,6 +3423,10 @@ class AgentValidationCliContractTests(unittest.TestCase):
             json.dumps(self.request()).encode("utf-8")
         )
         self.assertEqual(request["validation_commands"], ["git diff"])
+        self.assertEqual(
+            request["validation_output_paths"], [".dart_tool", "build"]
+        )
+        self.assertEqual(request["validation_read_paths"], ["src", "tests"])
 
         with self.assertRaisesRegex(qwen_agent_cli.RequestError, "array of strings"):
             qwen_agent_cli._parse_json_request(
@@ -1995,9 +3438,36 @@ class AgentValidationCliContractTests(unittest.TestCase):
             qwen_agent_cli._parse_json_request(
                 json.dumps(self.request(validation_commands=[""])).encode("utf-8")
             )
+        with self.assertRaisesRegex(qwen_agent_cli.RequestError, "array of strings"):
+            qwen_agent_cli._parse_json_request(
+                json.dumps(self.request(validation_output_paths="build")).encode(
+                    "utf-8"
+                )
+            )
+        with self.assertRaisesRegex(qwen_agent_cli.RequestError, "array of strings"):
+            qwen_agent_cli._parse_json_request(
+                json.dumps(self.request(validation_read_paths="src")).encode(
+                    "utf-8"
+                )
+            )
         with self.assertRaisesRegex(qwen_agent_cli.RequestError, "unknown request field"):
             qwen_agent_cli._parse_json_request(
                 json.dumps(self.request(unknown=True)).encode("utf-8")
+            )
+
+    def test_resume_json_field_is_strict_boolean(self):
+        request = qwen_agent_cli._parse_json_request(
+            json.dumps(self.request(resume=True)).encode("utf-8")
+        )
+        self.assertTrue(request["resume"])
+        self.assertFalse(
+            qwen_agent_cli._parse_json_request(
+                json.dumps(self.request()).encode("utf-8")
+            )["resume"]
+        )
+        with self.assertRaisesRegex(qwen_agent_cli.RequestError, "resume must be a boolean"):
+            qwen_agent_cli._parse_json_request(
+                json.dumps(self.request(resume="yes")).encode("utf-8")
             )
 
     def test_flag_mode_accepts_repeated_validation_command_flags(self):
@@ -2013,6 +3483,15 @@ class AgentValidationCliContractTests(unittest.TestCase):
                 "git diff",
                 "--validation-command",
                 "git status",
+                "--validation-read-path",
+                "src",
+                "--validation-read-path",
+                "tests",
+                "--validation-output-path",
+                ".dart_tool",
+                "--validation-output-path",
+                "build",
+                "--resume",
                 "--task",
                 "verify",
             ]
@@ -2020,6 +3499,11 @@ class AgentValidationCliContractTests(unittest.TestCase):
         self.assertEqual(
             request["validation_commands"], ["git diff", "git status"]
         )
+        self.assertEqual(
+            request["validation_output_paths"], [".dart_tool", "build"]
+        )
+        self.assertEqual(request["validation_read_paths"], ["src", "tests"])
+        self.assertTrue(request["resume"])
 
         with self.assertRaisesRegex(qwen_agent_cli.RequestError, "empty strings"):
             qwen_agent_cli._request_from_flags(
@@ -2053,7 +3537,10 @@ class AgentValidationCliContractTests(unittest.TestCase):
         )
         output = io.StringIO()
         with mock.patch.object(
-            qwen_agent_cli, "run_qwen_agent", return_value=result
+            qwen_agent_cli,
+            "run_qwen_agent_profile",
+            new_callable=mock.AsyncMock,
+            return_value=result.as_dict(),
         ) as run_agent, contextlib.redirect_stdout(output):
             self.assertEqual(
                 qwen_agent_cli.main(
@@ -2073,7 +3560,7 @@ class AgentValidationCliContractTests(unittest.TestCase):
                 0,
             )
         self.assertEqual(
-            run_agent.call_args.kwargs["validation_commands"], ["git diff"]
+            run_agent.await_args.kwargs["validation_commands"], ["git diff"]
         )
         document = json.loads(output.getvalue())
         self.assertEqual(document["status"], "validated")
@@ -2083,6 +3570,7 @@ class AgentValidationCliContractTests(unittest.TestCase):
         self.assertNotIn("PRIVATE_VALIDATION_OUTPUT", output.getvalue())
 
 
+@mock.patch("qwen_agent._omlx_api_headers", new=lambda: {})
 class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.endpoint_environment = mock.patch.dict(
@@ -2091,17 +3579,29 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         )
         self.endpoint_environment.start()
 
+    def test_token_aggregate_is_unknown_when_any_model_call_omits_usage(self):
+        self.assertIsNone(qwen_agent._aggregate_token_count([12, None], 2))
+
     def tearDown(self):
         self.endpoint_environment.stop()
 
-    async def test_max_action_case_keeps_history_bounded_and_telemetry_private(self):
+    async def test_discovery_limit_keeps_history_bounded_and_telemetry_private(self):
         sizes = []
         stderr = io.StringIO()
 
         async def fake_turn(_client, _base, _model, messages):
             sizes.append(sum(len(item["content"]) for item in messages))
             return AgentGeneration(
-                '{"action":"read","path":"example.txt"}', 1, 0, 1
+                json.dumps(
+                    {
+                        "action": "grep",
+                        "query": f"query-{len(sizes)}",
+                        "paths": ["example.txt"],
+                    }
+                ),
+                1,
+                0,
+                1,
             )
 
         with tempfile.TemporaryDirectory() as directory:
@@ -2113,7 +3613,7 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             ), mock.patch(
                 "qwen_agent._generate_agent_turn", new=fake_turn
             ), contextlib.redirect_stderr(stderr):
-                with self.assertRaisesRegex(RuntimeError, "AGENT_ACTION_LIMIT"):
+                with self.assertRaisesRegex(RuntimeError, "AGENT_DISCOVERY_LIMIT"):
                     await run_qwen_agent(
                         "repeat the read action",
                         directory,
@@ -2121,11 +3621,62 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
                         max_actions=100,
                     )
 
-        self.assertEqual(len(sizes), 100)
+        self.assertEqual(len(sizes), 23)
         self.assertLessEqual(max(sizes), MAX_AGENT_HISTORY_CHARS)
-        self.assertLessEqual(sizes[99], MAX_AGENT_HISTORY_CHARS)
+        self.assertLessEqual(sizes[-1], MAX_AGENT_HISTORY_CHARS)
         self.assertNotIn("SECRET_SOURCE_SENTINEL", stderr.getvalue())
         self.assertIn("history_chars=", stderr.getvalue())
+
+    async def test_baseline_failure_forces_edit_after_bounded_discovery(self):
+        requested_edit_mode = []
+        actions = [
+            {"action": "read", "path": "example.txt"},
+            *[
+                {
+                    "action": "grep",
+                    "query": f"needle-{index}",
+                    "paths": ["example.txt"],
+                }
+                for index in range(5)
+            ],
+            {
+                "action": "replace",
+                "path": "example.txt",
+                "old": "before",
+                "new": "after",
+            },
+            {"action": "done", "summary": "updated the failing source"},
+        ]
+
+        async def fake_turn(_client, _base, _model, _messages, **kwargs):
+            requested_edit_mode.append(kwargs.get("require_edit", False))
+            action = actions[len(requested_edit_mode) - 1]
+            return AgentGeneration(json.dumps(action), 1, 0, 1)
+
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "example.txt").write_text(
+                "before\nline\n", encoding="utf-8"
+            )
+            with mock.patch(
+                "qwen_agent._preflight", new=_fake_preflight
+            ), mock.patch(
+                "qwen_agent._generate_agent_turn", new=fake_turn
+            ):
+                result = await run_qwen_agent(
+                    "repair the implementation",
+                    directory,
+                    ["example.txt"],
+                    validation_failure="baseline test failed",
+                    max_actions=10,
+                )
+            self.assertEqual(
+                Path(directory, "example.txt").read_text(encoding="utf-8"),
+                "after\nline\n",
+            )
+        self.assertEqual(requested_edit_mode, [False] * 6 + [True, False])
+        self.assertEqual(result.files_changed, ["example.txt"])
+        self.assertEqual(result.generation_request_attempts, 8)
+        self.assertEqual(result.prefill_memory_retries, 0)
 
     async def test_finish_reason_length_fails(self):
         async def handler(_request):
@@ -2336,6 +3887,108 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertLess(error_stream.yielded, 100)
         self.assertEqual(calls, 1)
 
+    async def test_prefill_memory_error_retries_once_with_lower_output_cap(self):
+        request_caps = []
+
+        async def handler(request):
+            request_caps.append(json.loads(request.content)["max_tokens"])
+            if len(request_caps) == 1:
+                return httpx.Response(
+                    400,
+                    json={"error": {"code": "prefill_memory_exceeded"}},
+                )
+            return _sse_response(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "content": json.dumps(
+                                    {"action": "done", "summary": "finished"}
+                                )
+                            },
+                            "finish_reason": "stop",
+                        }
+                    ]
+                }
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            generation = await _generate_agent_turn(
+                client,
+                "http://qwen.test/v1",
+                DEFAULT_MODEL,
+                [{"role": "user", "content": "task"}],
+                sleep=lambda _delay: asyncio.sleep(0),
+            )
+
+        self.assertEqual(request_caps, [qwen_agent.MAX_OUTPUT_TOKENS, 2048])
+        self.assertEqual(generation.generation_request_attempts, 2)
+        self.assertEqual(generation.generation_token_cap, 2048)
+        self.assertEqual(generation.prefill_memory_retries, 1)
+        self.assertEqual(json.loads(generation.text)["action"], "done")
+
+    async def test_prefill_memory_error_stops_after_one_retry(self):
+        request_caps = []
+
+        async def handler(request):
+            request_caps.append(json.loads(request.content)["max_tokens"])
+            return httpx.Response(
+                400,
+                json={
+                    "error": {
+                        "code": "prefill_memory_exceeded",
+                        "estimated_bytes": 79363703680,
+                        "limit_bytes": 79054241792,
+                    }
+                },
+            )
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
+            with self.assertRaisesRegex(
+                RuntimeError,
+                "generation_token_cap=2048 prefill_memory_retries=1",
+            ):
+                await _generate_agent_turn(
+                    client,
+                    "http://qwen.test/v1",
+                    DEFAULT_MODEL,
+                    [{"role": "user", "content": "task"}],
+                    sleep=lambda _delay: asyncio.sleep(0),
+                )
+
+        self.assertEqual(request_caps, [qwen_agent.MAX_OUTPUT_TOKENS, 2048])
+
+    async def test_failed_prefill_retry_counts_are_logged(self):
+        async def fail_generation(*_args, **_kwargs):
+            raise RuntimeError(
+                "AGENT_GENERATION_HTTP attempts=2 generation_token_cap=2048 "
+                "prefill_memory_retries=1 status=400: prefill_memory_exceeded"
+            )
+
+        stderr = io.StringIO()
+        with tempfile.TemporaryDirectory() as directory:
+            Path(directory, "example.txt").write_text("source\n", encoding="utf-8")
+            with mock.patch(
+                "qwen_agent._preflight", new=_fake_preflight
+            ), mock.patch(
+                "qwen_agent._generate_agent_turn", new=fail_generation
+            ), contextlib.redirect_stderr(stderr):
+                with self.assertRaisesRegex(RuntimeError, "prefill_memory_exceeded"):
+                    await run_qwen_agent(
+                        "repair example.txt",
+                        directory,
+                        ["example.txt"],
+                        max_actions=1,
+                    )
+
+        self.assertIn("generation_request_attempts=2", stderr.getvalue())
+        self.assertIn("prefill_memory_retries=1", stderr.getvalue())
+        self.assertIn("generation_token_cap=2048", stderr.getvalue())
+
     async def test_agent_read_timeout_is_not_retried(self):
         calls = 0
 
@@ -2445,6 +4098,9 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             with mock.patch(
                 "qwen_agent.httpx.AsyncClient", TestClient
             ), mock.patch(
+                "qwen_agent._omlx_api_headers",
+                return_value={"Authorization": "Bearer unit-test-key"},
+            ), mock.patch(
                 "qwen_agent._preflight", new=_fake_preflight
             ), mock.patch(
                 "qwen_agent._generate_agent_turn", new=fake_turn
@@ -2460,6 +4116,9 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([options["trust_env"] for options in client_options], [False])
         self.assertEqual(
             [options["follow_redirects"] for options in client_options], [False]
+        )
+        self.assertEqual(
+            client_options[0]["headers"]["Authorization"], "Bearer unit-test-key"
         )
         prompt = captured_messages[0][1]["content"]
         self.assertNotIn(str(Path(directory).resolve()), prompt)
@@ -2497,7 +4156,17 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
                         }
                     ]
                 },
-                {"choices": [], "usage": {"completion_tokens": 7}},
+                {
+                    "choices": [],
+                    "usage": {
+                        "prompt_tokens": 31,
+                        "completion_tokens": 7,
+                        "total_tokens": 38,
+                    },
+                },
+                headers={
+                    "Warning": '199 omlx "response_format not enforced; output is best-effort"'
+                },
             )
 
         async with httpx.AsyncClient(
@@ -2511,6 +4180,9 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(result.reasoning_chars, len("private"))
         self.assertEqual(result.completion_tokens, 7)
+        self.assertEqual(result.prompt_tokens, 31)
+        self.assertEqual(result.total_tokens, 38)
+        self.assertTrue(result.response_format_warning)
 
     async def test_invalid_action_receives_protocol_error_then_done(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2582,9 +4254,16 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
                         4,
                         0,
                         1,
+                        prompt_tokens=11,
+                        total_tokens=15,
                     ),
                     AgentGeneration(
-                        '{"action":"done","summary":"replaced text"}', 2, 0, 1
+                        '{"action":"done","summary":"replaced text"}',
+                        2,
+                        0,
+                        1,
+                        prompt_tokens=13,
+                        total_tokens=15,
                     ),
                 ]
             )
@@ -2604,6 +4283,10 @@ class AgentTransportTests(unittest.IsolatedAsyncioTestCase):
                 )
             self.assertEqual(source.read_text(encoding="utf-8"), "hello qwen\n")
         self.assertEqual(result.files_changed, ["example.txt"])
+        self.assertEqual(result.prompt_tokens, 24)
+        self.assertEqual(result.completion_tokens, 6)
+        self.assertEqual(result.total_tokens, 30)
+        self.assertEqual(result.model, DEFAULT_MODEL)
 
     async def test_repair_invocation_reuses_existing_sandbox_state(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2694,7 +4377,10 @@ class AgentCliTaskFileTests(unittest.TestCase):
             task = "Türkçe görev\nİkinci satır\n"
             task_path.write_text(task, encoding="utf-8")
             with mock.patch.object(
-                qwen_agent_cli, "run_qwen_agent", return_value=result
+                qwen_agent_cli,
+                "run_qwen_agent_profile",
+                new_callable=mock.AsyncMock,
+                return_value=result.as_dict(),
             ) as run_agent:
                 self.assertEqual(
                     qwen_agent_cli.main(
@@ -2710,27 +4396,19 @@ class AgentCliTaskFileTests(unittest.TestCase):
                     0,
                 )
 
-        self.assertEqual(run_agent.call_args.kwargs["task"], task)
+        self.assertEqual(run_agent.await_args.kwargs["task"], task)
 
     def test_oversized_task_file_is_rejected_before_model(self):
-        result = qwen_agent.AgentResult(
-            status="done",
-            actions=0,
-            files_changed=[],
-            model_calls=0,
-            completion_tokens=0,
-            reasoning_chars=0,
-            elapsed_ms=0,
-            read_bytes=0,
-            write_bytes=0,
-        )
         with tempfile.TemporaryDirectory() as directory:
             task_path = Path(directory, "oversized-task.txt")
             task_path.write_bytes(
                 b"x" * (qwen_input_limits.MAX_TASK_BYTES + 1)
             )
             with mock.patch.object(
-                qwen_agent_cli, "run_qwen_agent", return_value=result
+                qwen_agent_cli,
+                "run_qwen_agent_profile",
+                new_callable=mock.AsyncMock,
+                side_effect=AssertionError("model must not be called"),
             ) as run_agent, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
                 io.StringIO()
             ) as stderr:
@@ -2781,7 +4459,10 @@ class InputBudgetCliTests(unittest.TestCase):
         stream = ShortReadStream(raw)
         stdin = type("Stdin", (), {"buffer": stream})()
         with mock.patch.object(
-            qwen_agent_cli, "run_qwen_agent", side_effect=AssertionError
+            qwen_agent_cli,
+            "run_qwen_agent_profile",
+            new_callable=mock.AsyncMock,
+            side_effect=AssertionError,
         ) as run_agent, mock.patch.object(
             qwen_agent_cli.sys, "stdin", stdin
         ), contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
@@ -2810,7 +4491,10 @@ class InputBudgetCliTests(unittest.TestCase):
             path = Path(directory, "request.json")
             path.write_bytes(b"x" * (qwen_input_limits.MAX_REQUEST_BYTES + 1))
             with mock.patch.object(
-                qwen_agent_cli, "run_qwen_agent", side_effect=AssertionError
+                qwen_agent_cli,
+                "run_qwen_agent_profile",
+                new_callable=mock.AsyncMock,
+                side_effect=AssertionError,
             ) as run_agent, contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
                 io.StringIO()
             ) as stderr:
