@@ -679,6 +679,180 @@ class SandboxActionTests(unittest.TestCase):
         self.assertEqual(agent.mutation_generation, 0)
         self.assertEqual(agent.rollback_count, 3)
 
+    def test_failed_command_symlink_swap_cannot_write_outside_writable_scope(self):
+        command = f"{shlex.quote(sys.executable)} --version"
+        for target_kind in ("outside", "private"):
+            with self.subTest(target_kind=target_kind):
+                generated = self.root / f"generated-{target_kind}"
+                nested = generated / "nested"
+                nested.mkdir(parents=True)
+                (nested / "victim.txt").write_text("before snapshot\n")
+
+                if target_kind == "outside":
+                    outside_directory = tempfile.TemporaryDirectory(
+                        prefix="qwen-rollback-outside-"
+                    )
+                    self.addCleanup(outside_directory.cleanup)
+                    target = Path(outside_directory.name)
+                else:
+                    target = self.root / "private"
+                    target.mkdir()
+                (target / "victim.txt").write_text("protected sentinel\n")
+
+                agent = SandboxAgent(
+                    self.root, [generated.name], allowed_commands=[command]
+                )
+
+                class FakeSandbox:
+                    def run(self, _argv, **_kwargs):
+                        shutil.rmtree(nested)
+                        nested.symlink_to(target, target_is_directory=True)
+                        return qwen_agent.CommandResult(1, "failed", "injected")
+
+                with mock.patch(
+                    "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+                ):
+                    result = agent.execute({"action": "run", "command": command})
+
+                self.assertFalse(result["ok"])
+                self.assertEqual(
+                    (target / "victim.txt").read_text(encoding="utf-8"),
+                    "protected sentinel\n",
+                )
+                self.assertTrue(nested.is_dir())
+                self.assertFalse(nested.is_symlink())
+                self.assertEqual(
+                    (nested / "victim.txt").read_text(encoding="utf-8"),
+                    "before snapshot\n",
+                )
+                self.assertEqual(agent.changed_paths, set())
+
+    def test_failed_command_with_symlinked_file_scope_parent_fails_closed(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        private = self.root / "private"
+        private.mkdir()
+        protected = private / "new.txt"
+        protected.write_text("protected sentinel\n", encoding="utf-8")
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(
+            self.root, ["generated/new.txt"], allowed_commands=[command]
+        )
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                generated.rmdir()
+                generated.symlink_to(private, target_is_directory=True)
+                return qwen_agent.CommandResult(1, "failed", "injected")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            with self.assertRaisesRegex(
+                AgentError, "could not be safely tracked or rolled back"
+            ):
+                agent.execute({"action": "run", "command": command})
+
+        self.assertEqual(protected.read_text(encoding="utf-8"), "protected sentinel\n")
+        self.assertTrue(generated.is_symlink())
+
+    def test_failed_command_restores_symlink_object_without_following_target(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        outside_directory = tempfile.TemporaryDirectory(
+            prefix="qwen-rollback-link-target-"
+        )
+        self.addCleanup(outside_directory.cleanup)
+        target = Path(outside_directory.name) / "target.txt"
+        target.write_text("protected sentinel\n", encoding="utf-8")
+        link = generated / "link.txt"
+        link.symlink_to(target)
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(self.root, ["generated"], allowed_commands=[command])
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                link.unlink()
+                link.write_text("temporary replacement\n", encoding="utf-8")
+                return qwen_agent.CommandResult(1, "failed", "injected")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.readlink(), target)
+        self.assertEqual(target.read_text(encoding="utf-8"), "protected sentinel\n")
+
+    def test_failed_command_restores_file_changes_in_read_only_nested_directory(self):
+        generated = self.root / "generated"
+        nested = generated / "nested"
+        nested.mkdir(parents=True)
+        tracked = nested / "tracked.txt"
+        tracked.write_text("before\n", encoding="utf-8")
+        nested.chmod(0o555)
+        command = f"{shlex.quote(sys.executable)} --version"
+        agent = SandboxAgent(self.root, ["generated"], allowed_commands=[command])
+
+        class FakeSandbox:
+            def run(self, _argv, **_kwargs):
+                nested.chmod(0o755)
+                tracked.write_text("partial\n", encoding="utf-8")
+                (nested / "created.txt").write_text("created\n", encoding="utf-8")
+                nested.chmod(0o555)
+                return qwen_agent.CommandResult(1, "failed", "injected")
+
+        with mock.patch(
+            "qwen_agent._discover_command_sandbox", return_value=FakeSandbox()
+        ):
+            result = agent.execute({"action": "run", "command": command})
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(tracked.read_text(encoding="utf-8"), "before\n")
+        self.assertFalse((nested / "created.txt").exists())
+        self.assertEqual(nested.stat().st_mode & 0o777, 0o555)
+
+    def test_snapshot_rejects_directory_symlink_swap_between_check_and_open(self):
+        generated = self.root / "generated"
+        nested = generated / "nested"
+        nested.mkdir(parents=True)
+        (nested / "tracked.txt").write_text("inside\n", encoding="utf-8")
+        outside_directory = tempfile.TemporaryDirectory(
+            prefix="qwen-rollback-race-target-"
+        )
+        self.addCleanup(outside_directory.cleanup)
+        outside = Path(outside_directory.name)
+        protected = outside / "protected.txt"
+        protected.write_text("protected sentinel\n", encoding="utf-8")
+        agent = SandboxAgent(self.root, ["generated"])
+        root_fd = agent._open_command_root_fd()
+        original_open_directory = agent._open_verified_command_directory
+        swapped = False
+
+        def swap_before_open(parent_fd, name, observed):
+            nonlocal swapped
+            if name == "nested" and not swapped:
+                nested.rename(generated / "nested-moved")
+                nested.symlink_to(outside, target_is_directory=True)
+                swapped = True
+            return original_open_directory(parent_fd, name, observed)
+
+        try:
+            with mock.patch.object(
+                agent,
+                "_open_verified_command_directory",
+                side_effect=swap_before_open,
+            ):
+                with self.assertRaisesRegex(AgentError, "changed during safe inspection"):
+                    agent._snapshot_writable_state(root_fd)
+        finally:
+            os.close(root_fd)
+
+        self.assertTrue(swapped)
+        self.assertEqual(protected.read_text(encoding="utf-8"), "protected sentinel\n")
+
     def test_model_command_without_mutation_keeps_generation(self):
         command = f"{shlex.quote(sys.executable)} --version"
         agent = SandboxAgent(
@@ -1141,6 +1315,61 @@ class MacOSCommandSandboxIntegrationTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertNotIn("TOP_SECRET_SYMLINK_SENTINEL", result["stdout"])
         self.assertNotIn("TOP_SECRET_SYMLINK_SENTINEL", result["stderr"])
+
+    def test_failed_command_symlink_swap_rollback_stays_inside_writable_scope(self):
+        generated = self.root / "generated"
+        nested = generated / "nested"
+        nested.mkdir(parents=True)
+        (nested / "victim.txt").write_text("before snapshot\n", encoding="utf-8")
+        outside = self.root.parent / f"{self.root.name}-rollback-outside"
+        outside.mkdir()
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        (outside / "victim.txt").write_text("protected sentinel\n", encoding="utf-8")
+
+        code = (
+            "import os, shutil, sys; "
+            "shutil.rmtree('generated/nested'); "
+            f"os.symlink({str(outside)!r}, 'generated/nested', target_is_directory=True); "
+            "print('SYMLINK_CREATED', flush=True); sys.exit(23)"
+        )
+        result, _agent = self._run_python(code, allow=["generated"])
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("SYMLINK_CREATED", result["stdout"])
+        self.assertEqual(
+            (outside / "victim.txt").read_text(encoding="utf-8"),
+            "protected sentinel\n",
+        )
+        self.assertTrue(nested.is_dir())
+        self.assertFalse(nested.is_symlink())
+        self.assertEqual(
+            (nested / "victim.txt").read_text(encoding="utf-8"),
+            "before snapshot\n",
+        )
+
+    def test_failed_command_cannot_move_writable_scope_outside_sandbox(self):
+        generated = self.root / "generated"
+        generated.mkdir()
+        (generated / "nested").mkdir()
+        private = self.root / "private"
+        private.mkdir()
+        destination = private / "generated"
+
+        code = (
+            "import os, sys\n"
+            "try:\n"
+            "    os.rename('generated', 'private/generated')\n"
+            "except OSError as exc:\n"
+            "    print('RENAME_DENIED', type(exc).__name__, flush=True)\n"
+            "    sys.exit(23)\n"
+            "print('RENAME_ALLOWED', flush=True)\n"
+        )
+        result, _agent = self._run_python(code, allow=["generated"])
+
+        self.assertFalse(result["ok"], result)
+        self.assertIn("RENAME_DENIED", result["stdout"])
+        self.assertTrue(generated.is_dir())
+        self.assertFalse(destination.exists())
 
     def test_out_of_scope_sandbox_read_is_denied_without_secret_output(self):
         private = self.root / "private.txt"

@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import errno
 import hashlib
 import json
 import os
 import re
+import secrets
 import selectors
 import shlex
 import shutil
@@ -2020,40 +2022,194 @@ class SandboxAgent:
             validation=validation,
         )
 
-    def _snapshot_writable_state(self) -> dict[str, _CommandPathSnapshot]:
+    @staticmethod
+    def _command_rollback_directory_flags() -> int:
+        no_follow = getattr(os, "O_NOFOLLOW", 0)
+        directory = getattr(os, "O_DIRECTORY", 0)
+        if not no_follow or not directory:
+            raise AgentError("safe command rollback is unavailable on this platform")
+        required_dir_fd = (
+            os.open,
+            os.stat,
+            os.readlink,
+            os.unlink,
+            os.rmdir,
+            os.mkdir,
+            os.rename,
+            os.symlink,
+        )
+        if any(function not in os.supports_dir_fd for function in required_dir_fd):
+            raise AgentError("safe command rollback is unavailable on this platform")
+        if os.listdir not in os.supports_fd or not hasattr(os, "fchmod"):
+            raise AgentError("safe command rollback is unavailable on this platform")
+        return (
+            os.O_RDONLY
+            | directory
+            | no_follow
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+
+    def _open_command_root_fd(self) -> int:
+        """Open the sandbox root without following any path component."""
+        directory_flags = self._command_rollback_directory_flags()
+        root_fd: int | None = None
+        try:
+            root_fd = os.open(os.path.sep, directory_flags)
+            for component in self.root.parts[1:]:
+                child_fd = os.open(component, directory_flags, dir_fd=root_fd)
+                os.close(root_fd)
+                root_fd = child_fd
+            return root_fd
+        except OSError as exc:
+            if root_fd is not None:
+                os.close(root_fd)
+            raise AgentError(
+                "command mutation snapshot could not safely open sandbox root"
+            ) from exc
+
+    def _open_command_directory_fd(
+        self,
+        root_fd: int,
+        components: tuple[str, ...],
+        *,
+        missing_ok: bool = False,
+    ) -> int | None:
+        """Walk a relative path using directory handles and no-follow opens."""
+        directory_flags = self._command_rollback_directory_flags()
+        current_fd = os.dup(root_fd)
+        for component in components:
+            try:
+                child_fd = os.open(component, directory_flags, dir_fd=current_fd)
+            except OSError as exc:
+                os.close(current_fd)
+                if missing_ok and exc.errno in {
+                    errno.ENOENT,
+                    errno.ENOTDIR,
+                    errno.ELOOP,
+                }:
+                    return None
+                raise AgentError(
+                    "command rollback encountered an unsafe directory path"
+                ) from exc
+            os.close(current_fd)
+            current_fd = child_fd
+        return current_fd
+
+    @staticmethod
+    def _command_entry_stat(parent_fd: int, name: str) -> os.stat_result | None:
+        try:
+            return os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise AgentError("command mutation snapshot could not inspect path") from exc
+
+    @staticmethod
+    def _same_command_inode(first: os.stat_result, second: os.stat_result) -> bool:
+        return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+    @classmethod
+    def _same_command_snapshot_stat(
+        cls, first: os.stat_result, second: os.stat_result
+    ) -> bool:
+        return cls._same_command_inode(first, second) and (
+            first.st_mode == second.st_mode
+            and first.st_size == second.st_size
+            and first.st_mtime_ns == second.st_mtime_ns
+            and first.st_ctime_ns == second.st_ctime_ns
+        )
+
+    def _open_verified_command_directory(
+        self, parent_fd: int, name: str, observed: os.stat_result
+    ) -> int:
+        directory_flags = self._command_rollback_directory_flags()
+        try:
+            directory_fd = os.open(name, directory_flags, dir_fd=parent_fd)
+            opened = os.fstat(directory_fd)
+            if not stat.S_ISDIR(opened.st_mode) or not self._same_command_inode(
+                observed, opened
+            ):
+                os.close(directory_fd)
+                raise AgentError("command directory changed during safe inspection")
+            return directory_fd
+        except OSError as exc:
+            raise AgentError(
+                "command directory changed during safe inspection"
+            ) from exc
+
+    def _snapshot_writable_state(
+        self, root_fd: int
+    ) -> dict[str, _CommandPathSnapshot]:
         snapshots: dict[str, _CommandPathSnapshot] = {}
         tracked_bytes = 0
+        file_open_flags = (
+            os.O_RDONLY
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+        )
 
-        def record(relative: str, path: Path, *, recurse: bool) -> None:
+        def record(
+            relative: str,
+            parent_fd: int,
+            name: str,
+            *,
+            recurse: bool,
+        ) -> None:
             nonlocal tracked_bytes
             if relative in snapshots:
                 return
             if len(snapshots) >= MAX_COMMAND_TRACKED_FILES:
                 raise AgentError("command mutation snapshot exceeds file limit")
-            try:
-                observed = path.lstat()
-            except FileNotFoundError:
+            observed = self._command_entry_stat(parent_fd, name)
+            if observed is None:
                 snapshots[relative] = _CommandPathSnapshot("missing")
                 return
-            except OSError as exc:
-                raise AgentError("command mutation snapshot could not inspect path") from exc
 
             mode = stat.S_IFMT(observed.st_mode)
             permissions = stat.S_IMODE(observed.st_mode)
             if stat.S_ISREG(mode):
-                if observed.st_size > MAX_COMMAND_TRACKED_BYTES - tracked_bytes:
+                remaining_bytes = MAX_COMMAND_TRACKED_BYTES - tracked_bytes
+                if observed.st_size > remaining_bytes:
                     raise AgentError("command mutation snapshot exceeds byte limit")
                 try:
-                    data = read_bounded_file(
-                        path,
-                        MAX_COMMAND_TRACKED_BYTES - tracked_bytes,
-                        field="command mutation snapshot",
-                        code="COMMAND_SNAPSHOT_TOO_LARGE",
-                    )
-                except (InputLimitError, OSError) as exc:
+                    file_fd = os.open(name, file_open_flags, dir_fd=parent_fd)
+                except OSError as exc:
                     raise AgentError(
-                        "command mutation snapshot exceeds byte limit"
+                        "command mutation snapshot could not safely read file"
                     ) from exc
+                try:
+                    opened = os.fstat(file_fd)
+                    if (
+                        not stat.S_ISREG(opened.st_mode)
+                        or not self._same_command_snapshot_stat(observed, opened)
+                    ):
+                        raise AgentError(
+                            "command file changed during safe snapshot"
+                        )
+                    chunks: list[bytes] = []
+                    total = 0
+                    while True:
+                        chunk = os.read(file_fd, min(65_536, remaining_bytes - total + 1))
+                        if not chunk:
+                            break
+                        total += len(chunk)
+                        if total > remaining_bytes:
+                            raise AgentError(
+                                "command mutation snapshot exceeds byte limit"
+                            )
+                        chunks.append(chunk)
+                    after_read = os.fstat(file_fd)
+                    current = self._command_entry_stat(parent_fd, name)
+                    if (
+                        current is None
+                        or not self._same_command_snapshot_stat(opened, after_read)
+                        or not self._same_command_snapshot_stat(opened, current)
+                    ):
+                        raise AgentError("command file changed during safe snapshot")
+                    data = b"".join(chunks)
+                finally:
+                    os.close(file_fd)
                 tracked_bytes += len(data)
                 snapshots[relative] = _CommandPathSnapshot(
                     f"file:{permissions:o}",
@@ -2061,38 +2217,73 @@ class SandboxAgent:
                     content=data,
                 )
                 return
+
             if stat.S_ISLNK(mode):
                 try:
-                    target = os.readlink(path)
+                    target = os.readlink(name, dir_fd=parent_fd)
                 except OSError as exc:
                     raise AgentError(
                         "command mutation snapshot could not inspect symlink"
                     ) from exc
+                current = self._command_entry_stat(parent_fd, name)
+                if (
+                    current is None
+                    or not self._same_command_snapshot_stat(observed, current)
+                ):
+                    raise AgentError("command symlink changed during safe snapshot")
                 snapshots[relative] = _CommandPathSnapshot(
                     "symlink",
                     hashlib.sha256(os.fsencode(target)).hexdigest(),
                     symlink_target=target,
                 )
                 return
+
             if stat.S_ISDIR(mode):
                 snapshots[relative] = _CommandPathSnapshot(
                     f"directory:{permissions:o}"
                 )
                 if not recurse:
                     return
+                directory_fd = self._open_verified_command_directory(
+                    parent_fd, name, observed
+                )
                 try:
-                    children = sorted(path.iterdir(), key=lambda child: child.name)
-                except OSError as exc:
-                    raise AgentError(
-                        "command mutation snapshot could not scan directory"
-                ) from exc
-                for child in children:
-                    record(f"{relative}/{child.name}", child, recurse=True)
+                    try:
+                        children = sorted(os.listdir(directory_fd))
+                    except OSError as exc:
+                        raise AgentError(
+                            "command mutation snapshot could not scan directory"
+                        ) from exc
+                    for child in children:
+                        record(
+                            f"{relative}/{child}",
+                            directory_fd,
+                            child,
+                            recurse=True,
+                        )
+                    after_scan = os.fstat(directory_fd)
+                    current = self._command_entry_stat(parent_fd, name)
+                    if (
+                        current is None
+                        or not self._same_command_snapshot_stat(observed, after_scan)
+                        or not self._same_command_snapshot_stat(observed, current)
+                    ):
+                        raise AgentError("command directory changed during safe snapshot")
+                finally:
+                    os.close(directory_fd)
                 return
+
             snapshots[relative] = _CommandPathSnapshot(f"special:{mode:o}")
 
         for relative, is_directory in sorted(self.writable_scopes):
-            record(relative, self.root / relative, recurse=is_directory)
+            parts = Path(relative).parts
+            parent_fd = self._open_command_directory_fd(root_fd, parts[:-1])
+            if parent_fd is None:
+                raise AgentError("command mutation snapshot could not open scope parent")
+            try:
+                record(relative, parent_fd, parts[-1], recurse=is_directory)
+            finally:
+                os.close(parent_fd)
         return snapshots
 
     def _record_command_mutations(
@@ -2111,12 +2302,209 @@ class SandboxAgent:
             self.mutation_generation += 1
         return sorted(changed)
 
+    def _remove_command_entry(self, parent_fd: int, name: str) -> None:
+        observed = self._command_entry_stat(parent_fd, name)
+        if observed is None:
+            return
+        if stat.S_ISDIR(observed.st_mode):
+            directory_fd = self._open_verified_command_directory(
+                parent_fd, name, observed
+            )
+            try:
+                opened = os.fstat(directory_fd)
+                os.fchmod(
+                    directory_fd,
+                    stat.S_IMODE(opened.st_mode) | stat.S_IRWXU,
+                )
+                try:
+                    children = sorted(os.listdir(directory_fd))
+                except OSError as exc:
+                    raise AgentError(
+                        "command rollback could not safely scan directory"
+                    ) from exc
+                for child in children:
+                    self._remove_command_entry(directory_fd, child)
+                current = self._command_entry_stat(parent_fd, name)
+                if current is None or not self._same_command_inode(observed, current):
+                    raise AgentError("command directory changed during rollback")
+                os.rmdir(name, dir_fd=parent_fd)
+            except OSError as exc:
+                raise AgentError("command rollback could not safely remove directory") from exc
+            finally:
+                os.close(directory_fd)
+            return
+
+        current = self._command_entry_stat(parent_fd, name)
+        if current is None:
+            return
+        if not self._same_command_inode(observed, current):
+            raise AgentError("command entry changed during rollback")
+        try:
+            os.unlink(name, dir_fd=parent_fd)
+        except OSError as exc:
+            raise AgentError("command rollback could not safely remove entry") from exc
+
+    def _ensure_command_directory(
+        self, parent_fd: int, name: str, permissions: int
+    ) -> None:
+        observed = self._command_entry_stat(parent_fd, name)
+        if observed is not None and not stat.S_ISDIR(observed.st_mode):
+            self._remove_command_entry(parent_fd, name)
+            observed = None
+        if observed is None:
+            try:
+                os.mkdir(name, permissions | stat.S_IRWXU, dir_fd=parent_fd)
+            except OSError as exc:
+                raise AgentError("command rollback could not safely create directory") from exc
+            observed = self._command_entry_stat(parent_fd, name)
+            if observed is None:
+                raise AgentError("command rollback could not verify directory creation")
+        directory_fd = self._open_verified_command_directory(
+            parent_fd, name, observed
+        )
+        try:
+            os.fchmod(directory_fd, permissions | stat.S_IRWXU)
+        except OSError as exc:
+            raise AgentError("command rollback could not safely prepare directory") from exc
+        finally:
+            os.close(directory_fd)
+
+    def _restore_command_file(
+        self, parent_fd: int, name: str, snapshot: _CommandPathSnapshot
+    ) -> None:
+        if snapshot.content is None:
+            raise AgentError("checkpoint is missing file contents")
+        permissions = int(snapshot.kind.split(":", 1)[1], 8)
+        temporary_name: str | None = None
+        temporary_fd: int | None = None
+        flags = (
+            os.O_WRONLY
+            | os.O_CREAT
+            | os.O_EXCL
+            | getattr(os, "O_NOFOLLOW", 0)
+            | getattr(os, "O_CLOEXEC", 0)
+        )
+        try:
+            for _attempt in range(32):
+                candidate = f".qwen-rollback-{secrets.token_hex(12)}"
+                try:
+                    temporary_fd = os.open(
+                        candidate, flags, 0o600, dir_fd=parent_fd
+                    )
+                    temporary_name = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if temporary_fd is None or temporary_name is None:
+                raise AgentError("command rollback could not allocate temporary file")
+            remaining = memoryview(snapshot.content)
+            while remaining:
+                written = os.write(temporary_fd, remaining)
+                if written <= 0:
+                    raise OSError(errno.EIO, "short rollback file write")
+                remaining = remaining[written:]
+            os.fchmod(temporary_fd, permissions)
+            os.fsync(temporary_fd)
+            os.close(temporary_fd)
+            temporary_fd = None
+
+            existing = self._command_entry_stat(parent_fd, name)
+            if existing is not None and stat.S_ISDIR(existing.st_mode):
+                self._remove_command_entry(parent_fd, name)
+            os.rename(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temporary_name = None
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("command rollback could not safely restore file") from exc
+        finally:
+            if temporary_fd is not None:
+                os.close(temporary_fd)
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise AgentError(
+                        "command rollback could not remove temporary file"
+                    ) from exc
+
+    def _restore_command_symlink(
+        self, parent_fd: int, name: str, snapshot: _CommandPathSnapshot
+    ) -> None:
+        if snapshot.symlink_target is None:
+            raise AgentError("checkpoint is missing symlink target")
+        temporary_name: str | None = None
+        try:
+            for _attempt in range(32):
+                candidate = f".qwen-rollback-{secrets.token_hex(12)}"
+                try:
+                    os.symlink(snapshot.symlink_target, candidate, dir_fd=parent_fd)
+                    temporary_name = candidate
+                    break
+                except FileExistsError:
+                    continue
+            if temporary_name is None:
+                raise AgentError("command rollback could not allocate temporary symlink")
+            existing = self._command_entry_stat(parent_fd, name)
+            if existing is not None and stat.S_ISDIR(existing.st_mode):
+                self._remove_command_entry(parent_fd, name)
+            os.rename(
+                temporary_name,
+                name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            temporary_name = None
+        except AgentError:
+            raise
+        except OSError as exc:
+            raise AgentError("command rollback could not safely restore symlink") from exc
+        finally:
+            if temporary_name is not None:
+                try:
+                    os.unlink(temporary_name, dir_fd=parent_fd)
+                except FileNotFoundError:
+                    pass
+                except OSError as exc:
+                    raise AgentError(
+                        "command rollback could not remove temporary symlink"
+                    ) from exc
+
+    def _set_command_directory_mode(
+        self, root_fd: int, relative: str, permissions: int
+    ) -> None:
+        parts = Path(relative).parts
+        parent_fd = self._open_command_directory_fd(root_fd, parts[:-1])
+        if parent_fd is None:
+            raise AgentError("command rollback could not reopen directory parent")
+        try:
+            observed = self._command_entry_stat(parent_fd, parts[-1])
+            if observed is None or not stat.S_ISDIR(observed.st_mode):
+                raise AgentError("command rollback directory changed unexpectedly")
+            directory_fd = self._open_verified_command_directory(
+                parent_fd, parts[-1], observed
+            )
+            try:
+                os.fchmod(directory_fd, permissions)
+            finally:
+                os.close(directory_fd)
+        finally:
+            os.close(parent_fd)
+
     def _restore_writable_state(
         self,
         before: dict[str, _CommandPathSnapshot],
         after: dict[str, _CommandPathSnapshot],
+        root_fd: int,
     ) -> list[str]:
-        """Roll back a failed command's changes within the writable scopes."""
+        """Restore command changes using only anchored, no-follow operations."""
         changed = sorted(
             (
                 relative
@@ -2124,67 +2512,98 @@ class SandboxAgent:
                 if before.get(relative) != after.get(relative)
             ),
             key=lambda relative: (len(Path(relative).parts), relative),
-            reverse=True,
         )
+        changed_set = set(changed)
+        work: list[str] = []
+        for relative in changed:
+            parts = Path(relative).parts
+            covered_by_replaced_parent = any(
+                "/".join(parts[:index]) in changed_set
+                and (
+                    before.get("/".join(parts[:index])) is None
+                    or before["/".join(parts[:index])].kind == "missing"
+                    or not before["/".join(parts[:index])].kind.startswith(
+                        "directory:"
+                    )
+                )
+                for index in range(1, len(parts))
+            )
+            if not covered_by_replaced_parent:
+                work.append(relative)
+
+        directories_to_prepare: set[str] = set()
+        for relative in changed:
+            parts = Path(relative).parts
+            for index in range(1, len(parts)):
+                ancestor = "/".join(parts[:index])
+                ancestor_snapshot = before.get(ancestor)
+                if (
+                    ancestor_snapshot is not None
+                    and ancestor_snapshot.kind.startswith("directory:")
+                ):
+                    directories_to_prepare.add(ancestor)
+            snapshot = before.get(relative)
+            if snapshot is not None and snapshot.kind.startswith("directory:"):
+                directories_to_prepare.add(relative)
+
+        directory_modes: list[tuple[str, int]] = []
         try:
-            for relative in changed:
-                snapshot = before.get(relative)
-                path = self.root / relative
-                if snapshot is None or snapshot.kind == "missing":
-                    if path.is_dir() and not path.is_symlink():
-                        shutil.rmtree(path)
-                    else:
-                        path.unlink(missing_ok=True)
-                    continue
-
-                if snapshot.kind.startswith("directory:"):
-                    if path.is_symlink() or (path.exists() and not path.is_dir()):
-                        path.unlink()
-                    path.mkdir(parents=True, exist_ok=True)
-                    os.chmod(path, int(snapshot.kind.split(":", 1)[1], 8))
-                    continue
-
-                if snapshot.kind.startswith("file:"):
-                    if snapshot.content is None:
-                        raise AgentError("checkpoint is missing file contents")
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        dir=path.parent,
-                        prefix=f".{path.name}.qwen-rollback-",
-                        delete=False,
-                    ) as temporary:
-                        temporary_name = temporary.name
-                        temporary.write(snapshot.content)
-                        temporary.flush()
-                        os.fsync(temporary.fileno())
-                    try:
-                        if path.is_dir() and not path.is_symlink():
-                            shutil.rmtree(path)
-                        elif path.exists() or path.is_symlink():
-                            path.unlink()
-                        os.chmod(
-                            temporary_name,
-                            int(snapshot.kind.split(":", 1)[1], 8),
+            try:
+                # Prepare every tracked directory needed by a changed path.
+                # This also handles a command that temporarily removed parent
+                # write permission before failing.
+                for relative in sorted(
+                    directories_to_prepare,
+                    key=lambda item: (len(Path(item).parts), item),
+                ):
+                    snapshot = before[relative]
+                    permissions = int(snapshot.kind.split(":", 1)[1], 8)
+                    directory_modes.append((relative, permissions))
+                    parts = Path(relative).parts
+                    parent_fd = self._open_command_directory_fd(root_fd, parts[:-1])
+                    if parent_fd is None:
+                        raise AgentError(
+                            "command rollback could not open directory parent"
                         )
-                        os.replace(temporary_name, path)
+                    try:
+                        self._ensure_command_directory(
+                            parent_fd, parts[-1], permissions
+                        )
                     finally:
-                        Path(temporary_name).unlink(missing_ok=True)
-                    continue
+                        os.close(parent_fd)
 
-                if snapshot.kind == "symlink":
-                    if snapshot.symlink_target is None:
-                        raise AgentError("checkpoint is missing symlink target")
-                    if path.exists() or path.is_symlink():
-                        if path.is_dir() and not path.is_symlink():
-                            shutil.rmtree(path)
+                # Real parent directories now exist before their children are
+                # restored, so no operation can traverse a replaced symlink.
+                for relative in work:
+                    snapshot = before.get(relative)
+                    if snapshot is not None and snapshot.kind.startswith("directory:"):
+                        continue
+                    parts = Path(relative).parts
+                    parent_fd = self._open_command_directory_fd(root_fd, parts[:-1])
+                    if parent_fd is None:
+                        raise AgentError("command rollback could not open path parent")
+                    try:
+                        if snapshot is None or snapshot.kind == "missing":
+                            self._remove_command_entry(parent_fd, parts[-1])
+                        elif snapshot.kind.startswith("file:"):
+                            self._restore_command_file(parent_fd, parts[-1], snapshot)
+                        elif snapshot.kind == "symlink":
+                            self._restore_command_symlink(parent_fd, parts[-1], snapshot)
                         else:
-                            path.unlink()
-                    path.parent.mkdir(parents=True, exist_ok=True)
-                    path.symlink_to(snapshot.symlink_target)
-                    continue
-
-                raise AgentError("checkpoint contains an unsupported file type")
+                            raise AgentError(
+                                "checkpoint contains an unsupported file type"
+                            )
+                    finally:
+                        os.close(parent_fd)
+            finally:
+                # Always put tracked directory permissions back, even if a
+                # later restore step fails and the caller must fail closed.
+                for relative, permissions in reversed(directory_modes):
+                    self._set_command_directory_mode(
+                        root_fd, relative, permissions
+                    )
+        except AgentError as exc:
+            raise AgentError("failed command changes could not be rolled back") from exc
         except (OSError, ValueError) as exc:
             raise AgentError("failed command changes could not be rolled back") from exc
         return changed
@@ -2194,53 +2613,67 @@ class SandboxAgent:
     ) -> dict[str, Any]:
         executable = _resolve_command_executable(argv[0], self.root)
         sandbox = _discover_command_sandbox()
-        before = None if validation else self._snapshot_writable_state()
+        root_fd: int | None = None
+        before: dict[str, _CommandPathSnapshot] | None = None
         completed: CommandResult | None = None
         rolled_back_paths: list[str] = []
         command_changed_paths: list[str] = []
         try:
-            with tempfile.TemporaryDirectory(prefix="qwen-command-") as directory:
-                scratch_path = Path(directory).resolve(strict=True)
-                access_policy = self._command_access_policy(
-                    scratch_path, validation=validation
-                )
-                completed = sandbox.run(
-                    (str(executable), *argv[1:]),
-                    sandbox_root=self.root,
-                    access_policy=access_policy,
-                    environment=_safe_environment(scratch_path),
-                    timeout=COMMAND_TIMEOUT_SECONDS,
-                )
-                if completed.returncode == 0 and _flutter_cache_access_denied(
-                    executable,
-                    self.root,
-                    completed.stdout + "\n" + completed.stderr,
-                ):
-                    completed = CommandResult(
-                        1,
-                        completed.stdout,
-                        completed.stderr
-                        + "\nFlutter SDK cache access was denied by the command sandbox.",
+            if not validation:
+                root_fd = self._open_command_root_fd()
+                before = self._snapshot_writable_state(root_fd)
+            try:
+                with tempfile.TemporaryDirectory(prefix="qwen-command-") as directory:
+                    scratch_path = Path(directory).resolve(strict=True)
+                    access_policy = self._command_access_policy(
+                        scratch_path, validation=validation
                     )
-        finally:
-            if before is not None:
-                try:
-                    after = self._snapshot_writable_state()
-                    if completed is None or completed.returncode != 0:
-                        rolled_back_paths = self._restore_writable_state(
+                    completed = sandbox.run(
+                        (str(executable), *argv[1:]),
+                        sandbox_root=self.root,
+                        access_policy=access_policy,
+                        environment=_safe_environment(scratch_path),
+                        timeout=COMMAND_TIMEOUT_SECONDS,
+                    )
+                    if completed.returncode == 0 and _flutter_cache_access_denied(
+                        executable,
+                        self.root,
+                        completed.stdout + "\n" + completed.stderr,
+                    ):
+                        completed = CommandResult(
+                            1,
+                            completed.stdout,
+                            completed.stderr
+                            + "\nFlutter SDK cache access was denied by the command sandbox.",
+                        )
+            finally:
+                if before is not None and root_fd is not None:
+                    try:
+                        after = self._snapshot_writable_state(root_fd)
+                        if completed is None or completed.returncode != 0:
+                            rolled_back_paths = self._restore_writable_state(
+                                before, after, root_fd
+                            )
+                            after = self._snapshot_writable_state(root_fd)
+                            if after != before:
+                                raise AgentError(
+                                    "failed command changes could not be rolled back completely"
+                                )
+                            self.rollback_count += len(rolled_back_paths)
+                        command_changed_paths = self._record_command_mutations(
                             before, after
                         )
-                        self.rollback_count += len(rolled_back_paths)
-                        after = self._snapshot_writable_state()
-                    command_changed_paths = self._record_command_mutations(
-                        before, after
-                    )
-                except AgentError:
-                    # A post-command tracking failure must invalidate validation
-                    # state instead of allowing an unobserved project mutation.
-                    self._invalidate_all_observations()
-                    self.mutation_generation += 1
-                    raise
+                    except AgentError as exc:
+                        # A post-command tracking failure must invalidate validation
+                        # state instead of allowing an unobserved project mutation.
+                        self._invalidate_all_observations()
+                        self.mutation_generation += 1
+                        raise AgentError(
+                            "failed command changes could not be safely tracked or rolled back"
+                        ) from exc
+        finally:
+            if root_fd is not None:
+                os.close(root_fd)
         if completed is None:
             raise AgentError("command did not return a result")
         result = {
