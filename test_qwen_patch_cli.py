@@ -296,7 +296,11 @@ class CliIntegrationTests(unittest.TestCase):
                 check=False,
             )
 
-        self.assertEqual(result.returncode, 0)
+        self.assertEqual(
+            result.returncode,
+            0,
+            msg=result.stderr.decode("utf-8", errors="replace"),
+        )
         self.assertEqual(result.stdout, diff.encode("utf-8"))
         diagnostic = result.stderr.decode()
         self.assertIn("finish_reason='stop'", diagnostic)
