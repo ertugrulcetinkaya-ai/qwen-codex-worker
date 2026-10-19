@@ -284,6 +284,7 @@ class CliIntegrationTests(unittest.TestCase):
         diff = "--- example.txt\n+++ example.txt\n@@ -1 +1 @@\n-alpha\n+beta\n"
         environment = os.environ.copy()
         environment["QWEN_DEBUG"] = "1"
+        environment["QWEN_OMLX_SETTINGS_PATH"] = str(self.omlx_settings)
         with MockQwenServer(diff) as qwen:
             environment["QWEN_BASE_URL"] = qwen.base_url
             result = subprocess.run(
